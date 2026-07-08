@@ -125,12 +125,48 @@ Instead of supplying `--cert`/`--key`, let the installer provision a
    (key mode 0600). A still-valid existing cert covering the hostname
    (>30 days left) is **reused, not reissued**.
 
-Credentials — one of, preferably via environment (invisible to `ps`):
+#### Credentials — exactly what the key needs
 
-| Credential | Where to get it |
+One of the two, preferably via environment variable (invisible to `ps`):
+
+**Option A — Origin CA Key (`CF_ORIGIN_CA_KEY`, recommended)**
+
+- **Where:** Cloudflare dashboard → **My Profile → API Tokens** → scroll to
+  the **API Keys** section → **Origin CA Key** → View. It looks like
+  `v1.0-xxxxxxxx...`.
+- **What it can do:** issue and revoke Origin CA certificates for zones on
+  your account — *and nothing else*. It cannot touch DNS, zone settings,
+  firewall rules, or billing. That built-in narrowness is why it's the
+  recommended option.
+
+**Option B — API Token (`CF_API_TOKEN`)**
+
+Create at **My Profile → API Tokens → Create Token → Custom token** with
+exactly this permission set:
+
+| Setting | Value |
 |---|---|
-| `CF_ORIGIN_CA_KEY` (`v1.0-...`) | Cloudflare dashboard → SSL/TLS → Origin Server → **Origin CA Key** |
-| `CF_API_TOKEN` | Dashboard → My Profile → API Tokens → create with **Zone → SSL and Certificates → Edit** |
+| Permissions | **Zone → SSL and Certificates → Edit** (Edit, not Read — issuing a cert is a write) |
+| Zone Resources | **Include → Specific zone →** the zone your server name lives in |
+| Client IP Address Filtering | leave empty, or include the **origin server's public IP** — the API call is made *from the origin box* |
+| TTL | optional; see note below |
+
+Nothing else is required — no DNS permissions, no account-level permissions,
+no additional zones.
+
+**Credential hygiene notes**
+
+- The installer uses the credential **once per issuance** and never persists
+  it: it isn't written to `/etc/cf-owntracks/config`, and it's passed to
+  `curl` via a mode-600 temp config file (never on the command line).
+- Because the issued cert lasts 15 years and re-runs *reuse* a valid cert
+  instead of calling the API, you can safely give an API token a short TTL
+  or delete it right after installing.
+- If the API answers `Auth error` / `9109`: wrong credential type for the
+  auth header (Origin CA keys and API tokens are not interchangeable — the
+  installer picks the header by the `v1.0-` prefix), missing the Edit
+  permission, the zone isn't included in the token's scope, or IP filtering
+  is excluding the origin box.
 
 In interactive installs the installer offers auto-provisioning whenever no
 usable cert path is configured, and asks for the credential with hidden

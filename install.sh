@@ -556,7 +556,7 @@ cf_auto_cert() {
     fi
 
     if [[ -z "$CF_ORIGIN_CA_KEY" && -z "$CF_API_TOKEN" ]]; then
-        die "cf-auto-cert: no credentials. Set CF_ORIGIN_CA_KEY (dashboard: SSL/TLS -> Origin Server -> Origin CA Key) or CF_API_TOKEN (Zone > SSL and Certificates > Edit), or pass --cf-origin-ca-key / --cf-api-token"
+        die "cf-auto-cert: no credentials. Set CF_ORIGIN_CA_KEY (dashboard: My Profile -> API Tokens -> API Keys -> Origin CA Key) or CF_API_TOKEN (custom token: Zone > SSL and Certificates > Edit, scoped to this zone), or pass --cf-origin-ca-key / --cf-api-token"
     fi
 
     log_info "cf-auto-cert: requesting a 15-year origin certificate for ${SERVER_NAME}"
