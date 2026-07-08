@@ -496,11 +496,17 @@ run_diagnostics() {
         d_warn "journalctl not available"
     fi
 
-    # 3. Does the whole nginx config parse?
-    if nginx -t >/dev/null 2>&1; then
+    # 3. Does the whole nginx config parse? Capture the output too: nginx
+    # emits WARNINGS here (e.g. "conflicting server name") that mean another
+    # vhost is shadowing ours — the #1 reason the decision log stays empty.
+    local ngx_out
+    if ngx_out="$(nginx -t 2>&1)"; then
         d_pass "nginx -t"
     else
-        d_fail "nginx -t: $(nginx -t 2>&1 | tail -2 | tr '\n' ' ')"
+        d_fail "nginx -t: $(printf '%s' "$ngx_out" | tail -2 | tr '\n' ' ')"
+    fi
+    if grep -q 'conflicting server name' <<<"$ngx_out"; then
+        d_fail "nginx: CONFLICTING SERVER NAME — another vhost claims the same host:port, so the cf-owntracks vhost is IGNORED (no decision log, no enforcement at nginx level). Find it: grep -RIl '${CFO_SERVER_NAME:-<your-server-name>}' /etc/nginx/sites-enabled/ — then disable or merge the duplicate."
     fi
 
     # 4. Ports: managed / ssh / other — and the SSH-exclusion proof.
