@@ -1,5 +1,9 @@
 #!/usr/bin/env bash
-# cf-owntracks installer (Debian 12) — v2.0.0
+# =============================================================================
+# cf-owntracks installer (Debian 12) — v2.1.0
+#
+# (New to the bash idioms used here? See the guide at the top of
+#  lib/common.sh — every trick used below is explained there.)
 #
 # DEFAULT IS TEST MODE: everything installs and runs live (daemon, timer,
 # nginx vhost, firewall rules) but NOTHING ENFORCES. Would-block decisions are
@@ -8,16 +12,35 @@
 #
 # Settings are remembered: an existing /etc/cf-owntracks/config provides the
 # defaults for every prompt and is never clobbered.
+#
+# Reading order:
+#   1. usage + argument parsing
+#   2. small prompt helpers
+#   3. --uninstall early exit
+#   4. load existing config as defaults, detect 1.x installs
+#   5. server-name auto-detection (OwnTracks config -> nginx -> reverse DNS)
+#   6. interactive prompts
+#   7. validation
+#   8. diagnostics implementation (also used by --diagnostics)
+#   9. cf_auto_cert (automatic Cloudflare origin certificate)
+#  10. pre-flight checks (backend detection, SSH info, conflicts)
+#  11. --dry-run early exit
+#  12. snapshot + install files
+#  13. bootstrap refresh + enable timer + diagnostics + summary
+# =============================================================================
 
+# Strict mode — see the note at the top of bin/cf-owntracks-refresh.
 set -Eeuo pipefail
 
+# Directory this script lives in, so relative paths (lib/, nginx/, systemd/)
+# work no matter where the user runs it from.
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck disable=SC1091
 source "${SCRIPT_DIR}/lib/common.sh"
 
 usage() {
     cat <<'EOF'
-cf-owntracks installer (v2.0.0)
+cf-owntracks installer (v2.1.0)
 
 USAGE
     sudo ./install.sh [options]
@@ -78,15 +101,20 @@ EOF
 }
 
 # ---- Argument parsing ----------------------------------------------------------
+# Every flag lands in an ARG_* variable (empty string = "not given"), so that
+# later we can layer: flag > existing config > built-in default.
 ARG_SERVER_NAME=""; ARG_CERT=""; ARG_KEY=""; ARG_PORT=""
 ARG_MODE=""; ARG_MTLS=""; ARG_REDIRECT=""; ARG_ASN_FAILSAFE=""; ARG_ASNS=""
 ARG_INTERVAL=""; ARG_LOG_MAX=""; ARG_FORCE=""
-declare -a ARG_ALLOW=() ARG_MANAGE_PORTS=()
+declare -a ARG_ALLOW=() ARG_MANAGE_PORTS=()       # repeatable flags -> arrays
 ASSUME_YES=0; DRY_RUN=0; DO_UNINSTALL=0; DO_DIAGNOSTICS=0
 AUTO_CERT=0
+# Environment credentials are honored as-is; flags below can override them.
 CF_ORIGIN_CA_KEY="${CF_ORIGIN_CA_KEY:-}"
 CF_API_TOKEN="${CF_API_TOKEN:-}"
 
+# Classic manual argument loop: look at $1, consume it (and its value, when it
+# has one) with `shift`/`shift 2`, repeat until nothing is left.
 while (( $# )); do
     case "$1" in
         --server-name)          ARG_SERVER_NAME="$2"; shift 2 ;;
@@ -120,30 +148,38 @@ done
 
 require_root
 
+# Interactive = we may ask questions. Not interactive when --yes was given OR
+# when stdin isn't a terminal ([[ -t 0 ]] tests exactly that), e.g. when the
+# installer is run from a pipeline or automation.
 INTERACTIVE=1
 if (( ASSUME_YES == 1 )) || [[ ! -t 0 ]]; then
     INTERACTIVE=0
 fi
 
 # ---- Small prompt helpers --------------------------------------------------------
+# All prompts read from /dev/tty (the terminal directly) instead of stdin, so
+# they still work even if stdin is occupied.
+
 prompt_val() {
-    # prompt_val <question> <default> — echoes chosen value
+    # prompt_val <question> <default> — echoes chosen value.
+    # Non-interactive mode short-circuits to the default.
     local q="$1" def="$2" v
     if (( INTERACTIVE == 0 )); then
         printf '%s\n' "$def"
         return 0
     fi
     read -r -p "  ${q} [${def:-none}]: " v </dev/tty
-    printf '%s\n' "${v:-$def}"
+    printf '%s\n' "${v:-$def}"          # empty answer = accept the default
 }
 
 prompt_bool() {
-    # prompt_bool <question> <default-1-or-0> — echoes 1 or 0
+    # prompt_bool <question> <default-1-or-0> — echoes 1 or 0.
     local q="$1" def="$2" defstr v
     if (( INTERACTIVE == 0 )); then
         printf '%s\n' "$def"
         return 0
     fi
+    # Show which answer Enter will pick: capital letter = the default.
     [[ "$def" == "1" ]] && defstr="Y/n" || defstr="y/N"
     read -r -p "  ${q} [${defstr}]: " v </dev/tty
     case "${v,,}" in
@@ -155,6 +191,8 @@ prompt_bool() {
 }
 
 prompt_yn() {
+    # Yes/no CONFIRMATION (as opposed to a value prompt): returns success for
+    # yes, failure for no, and auto-confirms under --yes.
     local q="$1"
     if (( ASSUME_YES == 1 )); then
         log_info "[--yes] auto-confirming: $q"
@@ -169,6 +207,7 @@ prompt_yn() {
 do_uninstall() {
     log_info "uninstalling cf-owntracks"
 
+    # Stop and remove the systemd units first so nothing re-fires mid-removal.
     systemctl disable --now cf-owntracks.timer 2>/dev/null || true
     systemctl stop cf-owntracks-retry.timer 2>/dev/null || true
     systemctl disable --now cf-owntracks.service 2>/dev/null || true
@@ -177,6 +216,7 @@ do_uninstall() {
           /etc/systemd/system/cf-owntracks-retry.timer
     systemctl daemon-reload
 
+    # Remove our firewall rules using whichever backend the config recorded.
     if [[ -f "$CFO_CONFIG_FILE" ]]; then
         # shellcheck disable=SC1090
         source "$CFO_CONFIG_FILE"
@@ -188,6 +228,7 @@ do_uninstall() {
     fi
     rm -f /etc/nftables.d/cf-owntracks.conf 2>/dev/null || true
 
+    # Remove every nginx piece we own, then reload if the config still parses.
     rm -f "$CFO_NGINX_VHOST" "$CFO_NGINX_VHOST_ENABLED" \
           "$CFO_NGINX_GLOBAL_REDIRECT" "$CFO_NGINX_GLOBAL_REDIRECT_ENABLED" \
           "$CFO_NGINX_MAPS_CONF" "$CFO_NGINX_REALIP_SNIPPET" \
@@ -196,6 +237,7 @@ do_uninstall() {
           /etc/nginx/conf.d/cfo-upgrade-map.conf
     nginx -t >/dev/null 2>&1 && nginx -s reload || log_warn "nginx may need manual attention"
 
+    # Remove the program itself + its config.
     rm -f /usr/local/sbin/cf-owntracks-refresh
     rm -rf /usr/local/lib/cf-owntracks /usr/local/share/cf-owntracks /etc/cf-owntracks
 
@@ -209,6 +251,9 @@ if (( DO_UNINSTALL == 1 )); then
 fi
 
 # ---- Load existing config as defaults + detect 1.x --------------------------------
+# A prior install's config becomes the default for everything — this is what
+# "settings are never clobbered" means in practice. A config WITHOUT the
+# CFO_MODE key can only have been written by 1.x.
 UPGRADE_FROM_V1=0
 HAVE_EXISTING_CONFIG=0
 if [[ -f "$CFO_CONFIG_FILE" ]]; then
@@ -221,7 +266,8 @@ if [[ -f "$CFO_CONFIG_FILE" ]]; then
     log_info "existing configuration found — previous settings become defaults"
 fi
 
-# Merge precedence: flag > existing config > builtin default.
+# Merge precedence, one variable at a time: flag > existing config > builtin.
+# "${A:-${B:-c}}" reads as: use A if set, else B if set, else the literal c.
 SERVER_NAME="${ARG_SERVER_NAME:-${CFO_SERVER_NAME:-}}"
 TLS_CERT="${ARG_CERT:-${CFO_TLS_CERT:-}}"
 TLS_KEY="${ARG_KEY:-${CFO_TLS_KEY:-}}"
@@ -235,6 +281,9 @@ TEST_LOG_MAX_MB="${ARG_LOG_MAX:-${CFO_TEST_LOG_MAX_MB:-15}}"
 REFRESH_INTERVAL="${ARG_INTERVAL:-6h}"
 EXTRA_PORTS="${CFO_EXTRA_PORTS:-}"
 if (( ${#ARG_MANAGE_PORTS[@]} > 0 )); then
+    # Merge config extras with --manage-port flags: numbers only, dedupe,
+    # back to one space-separated line. ($EXTRA_PORTS is deliberately
+    # unquoted so its ports split into separate printf arguments.)
     EXTRA_PORTS="$(printf '%s\n' $EXTRA_PORTS "${ARG_MANAGE_PORTS[@]}" | grep -E '^[0-9]+$' | sort -un | tr '\n' ' ')"
     EXTRA_PORTS="${EXTRA_PORTS% }"
 fi
@@ -243,6 +292,8 @@ fi
 # Chain: OwnTracks recorder config -> nginx server_name directives -> reverse
 # DNS of the public IP. The recorder's own config is checked first — it knows
 # the public URL it serves under, which beats inferring from nginx.
+# Whatever is found only becomes the PROMPT DEFAULT; nothing is applied
+# silently.
 if [[ -z "$SERVER_NAME" ]] && (( DO_UNINSTALL == 0 )) && (( DO_DIAGNOSTICS == 0 )); then
     OT_TMP="$(mktemp)"
     discover_owntracks_hostname > "$OT_TMP" 2>/dev/null || true
@@ -273,6 +324,8 @@ if [[ -z "$SERVER_NAME" ]] && (( DO_UNINSTALL == 0 )) && (( DO_DIAGNOSTICS == 0 
             log_info "auto-detected server name from nginx: ${SERVER_NAME}"
         fi
     else
+        # Last resort: ask the internet what our public IP is, then look up
+        # its PTR (reverse DNS) record.
         PUB_IP="$(detect_public_ip || true)"
         if [[ -n "$PUB_IP" ]]; then
             PTR_NAME="$(reverse_dns "$PUB_IP" || true)"
@@ -290,6 +343,8 @@ if [[ -z "$SERVER_NAME" ]] && (( DO_UNINSTALL == 0 )) && (( DO_DIAGNOSTICS == 0 
     rm -f "$HN_TMP"
 fi
 
+# The 1.x upgrade notice — loud on purpose, because upgrading FLIPS an
+# enforcing system back to observe-only until --deploy is run again.
 if (( UPGRADE_FROM_V1 == 1 )); then
     echo
     echo "=============================================================================="
@@ -312,7 +367,7 @@ fi
 
 # ---- Interactive configuration -----------------------------------------------------
 if (( DO_DIAGNOSTICS == 0 )); then
-    echo "cf-owntracks v${CFO_VERSION} installer — mode: ${MODE^^}"
+    echo "cf-owntracks v${CFO_VERSION} installer — mode: ${MODE^^}"   # ^^ = UPPERCASE
     if [[ "$MODE" == "test" ]]; then
         echo "  (TEST mode: observe only, nothing enforces. Use --deploy to enforce.)"
     fi
@@ -328,8 +383,11 @@ if (( DO_DIAGNOSTICS == 0 )); then
         fi
         if (( AUTO_CERT == 1 )); then
             if [[ -z "$CF_ORIGIN_CA_KEY" && -z "$CF_API_TOKEN" ]]; then
+                # read -s = silent (no echo to the screen) — it's a secret.
                 read -rs -p "  Cloudflare Origin CA key (v1.0-...) or API token [input hidden]: " _cfsecret </dev/tty
                 echo
+                # Origin CA keys always start with "v1.0-"; use that to pick
+                # the right auth header later.
                 if [[ "$_cfsecret" == v1.0-* ]]; then
                     CF_ORIGIN_CA_KEY="$_cfsecret"
                 else
@@ -349,6 +407,7 @@ if (( DO_DIAGNOSTICS == 0 )); then
         TEST_LOG_MAX_MB="$(prompt_val "Decision log cap in MB (test mode)" "$TEST_LOG_MAX_MB")"
         extra_allow="$(prompt_val "Extra always-allow IPs/CIDRs (space-separated, empty for none)" "")"
         if [[ -n "$extra_allow" ]]; then
+            # Split the answer on spaces into an array, append to --allow list.
             read -r -a extra_arr <<<"$extra_allow"
             ARG_ALLOW+=("${extra_arr[@]}")
         fi
@@ -363,6 +422,7 @@ case "$REFRESH_INTERVAL" in
     6h|3h|12h|daily|hourly) : ;;
     *) die "unsupported --refresh-interval: $REFRESH_INTERVAL (use 6h/3h/12h/daily/hourly)" ;;
 esac
+# Every --allow entry must be a valid address/CIDR of one family or the other.
 for a in "${ARG_ALLOW[@]}"; do
     n="$(normalize_cidr "$a")"
     if [[ "$n" == *:* ]]; then
@@ -373,11 +433,14 @@ for a in "${ARG_ALLOW[@]}"; do
 done
 
 # ---- Diagnostics implementation ------------------------------------------------------
+# PASS/WARN/FAIL counters + printers used by run_diagnostics below.
 DIAG_PASS=0; DIAG_WARN=0; DIAG_FAIL=0
 d_pass() { printf '  PASS  %s\n' "$1"; DIAG_PASS=$((DIAG_PASS+1)); }
 d_warn() { printf '  WARN  %s\n' "$1"; DIAG_WARN=$((DIAG_WARN+1)); }
 d_fail() { printf '  FAIL  %s\n' "$1"; DIAG_FAIL=$((DIAG_FAIL+1)); }
 
+# One HTTP reachability probe: PASS on any 2xx answer.
+# curl -w '%{http_code} %{time_total}s' appends "200 0.13s"-style stats.
 diag_endpoint() {
     local label="$1" url="$2" code t
     t="$(mktemp)"
@@ -393,7 +456,8 @@ diag_endpoint() {
 run_diagnostics() {
     echo
     echo "== DIAGNOSTICS ==============================================================="
-    # Mode banner
+    # Re-read the installed config so --diagnostics reflects reality, not the
+    # variables of the current installer invocation.
     if [[ -f "$CFO_CONFIG_FILE" ]]; then
         # shellcheck disable=SC1090
         source "$CFO_CONFIG_FILE"
@@ -405,7 +469,7 @@ run_diagnostics() {
         echo "  MODE: TEST — ENFORCEMENT OFF (observe only)"
     fi
 
-    # 1. API endpoints
+    # 1. Can we reach every API this tool depends on?
     diag_endpoint "cloudflare.com/ips-v4" "$CFO_IPS_V4_URL"
     diag_endpoint "cloudflare.com/ips-v6" "$CFO_IPS_V6_URL"
     if [[ "${CFO_MTLS_ENABLED:-1}" == "1" ]]; then
@@ -417,7 +481,7 @@ run_diagnostics() {
         diag_endpoint "RIPEstat AS${first_asn}" "${CFO_RIPESTAT_URL}${first_asn}"
     fi
 
-    # 2. journald round-trip
+    # 2. journald round-trip: write a unique token, read it back.
     local token
     token="cfo-diag-$$-$(date +%s)"
     logger -t cf-owntracks -- "$token" 2>/dev/null || true
@@ -432,14 +496,14 @@ run_diagnostics() {
         d_warn "journalctl not available"
     fi
 
-    # 3. nginx
+    # 3. Does the whole nginx config parse?
     if nginx -t >/dev/null 2>&1; then
         d_pass "nginx -t"
     else
         d_fail "nginx -t: $(nginx -t 2>&1 | tail -2 | tr '\n' ' ')"
     fi
 
-    # 4. Ports: managed / ssh / other
+    # 4. Ports: managed / ssh / other — and the SSH-exclusion proof.
     local ssh_ports managed other p
     ssh_ports="$(detect_ssh_ports | tr '\n' ' ')"
     if [[ -s "$CFO_PORTS_FILE" ]]; then
@@ -454,6 +518,7 @@ run_diagnostics() {
     echo "  all nginx ports:    ${other% } (non-managed ones are untouched; opt in via --manage-port)"
     local clash=0
     for p in ${managed}; do
+        # grep -qw = match the port as a whole word inside the SSH list.
         if grep -qw "$p" <<<"$ssh_ports"; then clash=1; fi
     done
     if (( clash == 0 )); then
@@ -462,7 +527,7 @@ run_diagnostics() {
         d_fail "SSH GUARD: managed set overlaps an SSH port — this should be impossible; do not deploy"
     fi
 
-    # Listeners
+    # Is something actually listening on each managed port?
     for p in ${managed}; do
         if ss -ltn "( sport = :${p} )" 2>/dev/null | grep -q LISTEN; then
             d_pass "listener on :${p}"
@@ -471,7 +536,7 @@ run_diagnostics() {
         fi
     done
 
-    # 5. Firewall state
+    # 5. Firewall state per backend.
     case "${CFO_FW_BACKEND:-unknown}" in
         nftables)
             if nft list table inet cf_owntracks >/dev/null 2>&1; then
@@ -497,7 +562,7 @@ run_diagnostics() {
         *) d_warn "firewall backend unknown (config missing?)" ;;
     esac
 
-    # 6. State + logs
+    # 6. State + logs: directories writable, caches populated, log sane.
     [[ -w "$CFO_STATE_DIR" ]] && d_pass "state dir writable ($CFO_STATE_DIR)" || d_fail "state dir not writable"
     if [[ "$mode" == "test" ]]; then
         if [[ -d "$CFO_LOG_DIR" && -w "$CFO_LOG_DIR" ]]; then
@@ -520,7 +585,7 @@ run_diagnostics() {
         d_pass "ASN failsafe cache: ${a4} novel v4 + ${a6} novel v6 prefixes"
     fi
 
-    # 7. Timer
+    # 7. Is the refresh timer alive, and when does it fire next?
     if systemctl is-active cf-owntracks.timer >/dev/null 2>&1; then
         d_pass "refresh timer active ($(systemctl show cf-owntracks.timer -p NextElapseUSecRealtime --value 2>/dev/null | head -1))"
     else
@@ -546,6 +611,9 @@ cf_auto_cert() {
     local cert_out="/etc/ssl/cloudflare/origin.pem"
     local key_out="/etc/ssl/cloudflare/origin.key"
 
+    # Reuse check: cert + key exist, cert is valid for at least another 30
+    # days (-checkend takes SECONDS: 2592000 = 30*24*3600), and its SAN list
+    # includes our hostname. If all true — done, nothing to issue.
     if [[ -s "$cert_out" && -s "$key_out" ]] && \
        openssl x509 -in "$cert_out" -noout -checkend 2592000 >/dev/null 2>&1 && \
        openssl x509 -in "$cert_out" -noout -text 2>/dev/null | grep -qF "DNS:${SERVER_NAME}"; then
@@ -563,6 +631,9 @@ cf_auto_cert() {
     local work
     work="$(mktemp -d)"
 
+    # Generate the private key + CSR locally — the key never leaves this box.
+    # umask 077 makes the key file unreadable to anyone but root the moment
+    # it is created; the ( ) subshell keeps that umask from leaking out.
     if ! ( umask 077; openssl req -new -newkey rsa:2048 -nodes \
             -keyout "${work}/origin.key" \
             -subj "/CN=${SERVER_NAME}" \
@@ -571,14 +642,18 @@ cf_auto_cert() {
         die "cf-auto-cert: CSR generation failed"
     fi
 
-    # JSON-escape the CSR (real newlines -> literal \n).
+    # JSON strings cannot contain real newlines, so convert the PEM's line
+    # breaks into the two characters "\n" (awk's ORS = output record separator).
     local csr_esc
     csr_esc="$(awk 'BEGIN{ORS="\\n"} {print}' "${work}/origin.csr")"
 
+    # requested_validity is in DAYS: 5475 = 15 years (Cloudflare's maximum).
     printf '{"hostnames":["%s"],"requested_validity":5475,"request_type":"origin-rsa","csr":"%s"}' \
         "$SERVER_NAME" "$csr_esc" > "${work}/payload.json"
 
-    # Credential goes into a curl config file, never onto the argv (ps-safe).
+    # The credential goes into a curl CONFIG FILE (-K) rather than a -H
+    # argument, so it never appears in `ps` output where other users could
+    # read it. Origin CA keys and API tokens use different auth headers.
     if [[ -n "$CF_ORIGIN_CA_KEY" ]]; then
         printf 'header = "X-Auth-User-Service-Key: %s"\n' "$CF_ORIGIN_CA_KEY" > "${work}/auth.cfg"
     else
@@ -595,6 +670,8 @@ cf_auto_cert() {
         die "cf-auto-cert: API request failed: ${resp:0:200}"
     fi
 
+    # Cloudflare's JSON always carries "success":true/false; on failure, pull
+    # the first human-readable "message" out for the error.
     if ! grep -q '"success":[[:space:]]*true' <<<"$resp"; then
         local apierr
         apierr="$(grep -o '"message":"[^"]*"' <<<"$resp" | head -1 | sed 's/^"message":"//;s/"$//')"
@@ -602,6 +679,8 @@ cf_auto_cert() {
         die "cf-auto-cert: Cloudflare API error: ${apierr:-unrecognized response (check credential type/permissions)}"
     fi
 
+    # Extract the "certificate" JSON string and turn its "\n" escapes back
+    # into real newlines to reconstruct the PEM.
     grep -o '"certificate":"[^"]*"' <<<"$resp" | head -1 \
         | sed 's/^"certificate":"//;s/"$//' \
         | sed 's/\\n/\n/g' > "${work}/origin.pem"
@@ -611,6 +690,7 @@ cf_auto_cert() {
         die "cf-auto-cert: API returned an unparseable certificate"
     fi
 
+    # Move into place: key readable by root only (0600), cert world-readable.
     install -d -m 0755 /etc/ssl/cloudflare
     install -m 0600 "${work}/origin.key" "$key_out"
     install -m 0644 "${work}/origin.pem" "$cert_out"
@@ -634,6 +714,8 @@ fi
 
 if (( AUTO_CERT == 1 )); then
     if (( DRY_RUN == 1 )); then
+        # A dry run must not create anything — just show what would happen
+        # and assume the canonical paths for the render preview.
         log_info "[--dry-run] would fetch a Cloudflare origin certificate for ${SERVER_NAME}"
         TLS_CERT="${TLS_CERT:-/etc/ssl/cloudflare/origin.pem}"
         TLS_KEY="${TLS_KEY:-/etc/ssl/cloudflare/origin.key}"
@@ -645,6 +727,7 @@ fi
 [[ -n "$TLS_CERT" ]] || die "--cert required (or use --cf-auto-cert, or answer the prompt)"
 [[ -n "$TLS_KEY"  ]] || die "--key required (or use --cf-auto-cert, or answer the prompt)"
 if (( DRY_RUN == 1 )); then
+    # Dry runs tolerate missing files (they may not be provisioned yet).
     [[ -r "$TLS_CERT" ]] || log_warn "[--dry-run] TLS cert not present yet: $TLS_CERT"
     [[ -r "$TLS_KEY"  ]] || log_warn "[--dry-run] TLS key not present yet: $TLS_KEY"
 else
@@ -652,6 +735,7 @@ else
     [[ -r "$TLS_KEY"  ]] || die "TLS key not readable: $TLS_KEY"
 fi
 
+# OS check: warn (don't abort) off-target — the tool may still work.
 if [[ -r /etc/os-release ]]; then
     # shellcheck disable=SC1091
     . /etc/os-release
@@ -662,6 +746,7 @@ if [[ -r /etc/os-release ]]; then
     fi
 fi
 
+# Everything this project shells out to must actually exist.
 for cmd in curl openssl flock nginx ip ss sha256sum awk grep sed install systemctl; do
     command -v "$cmd" >/dev/null 2>&1 || die "required command missing: $cmd"
 done
@@ -674,9 +759,12 @@ if [[ -n "$ARG_FORCE" ]]; then
     esac
     log_info "using forced backend: $BACKEND"
 elif (( HAVE_EXISTING_CONFIG == 1 )) && [[ -n "${CFO_FW_BACKEND:-}" ]]; then
+    # Reusing the recorded backend avoids detection drift on reinstalls.
     BACKEND="$CFO_FW_BACKEND"
     log_info "reusing configured backend: $BACKEND"
 else
+    # detect_firewall exits non-zero when the answer is ambiguous, and `set -e`
+    # would kill us mid-detection — so suspend -e around the call.
     set +e
     BACKEND="$(detect_firewall)"
     rc=$?
@@ -695,6 +783,7 @@ else
     log_info "detected firewall backend: $BACKEND"
 fi
 
+# The chosen backend's tools must be present.
 case "$BACKEND" in
     nftables) command -v nft >/dev/null || die "nft not installed" ;;
     ufw)      command -v ufw >/dev/null || die "ufw not installed" ;;
@@ -715,6 +804,8 @@ if ! check_ssh_reachable "$BACKEND"; then
     log_warn "cf-owntracks never touches SSH ports, but verify your own firewall policy."
 fi
 
+# nginx allows only ONE default_server per listen port — refuse to fight an
+# existing one rather than break the reload later.
 if [[ "$GLOBAL_REDIRECT" == "1" ]]; then
     if grep -RIn --include='*.conf' -E 'listen[[:space:]]+(\[::\]:)?80[[:space:]]+default_server' \
             /etc/nginx/sites-enabled /etc/nginx/conf.d 2>/dev/null \
@@ -723,6 +814,8 @@ if [[ "$GLOBAL_REDIRECT" == "1" ]]; then
     fi
 fi
 
+# Deploying with mTLS while the Cloudflare-side toggle is off would 403 every
+# request — make the operator confirm the dashboard is ready first.
 if [[ "$MODE" == "deploy" ]] && [[ "$MTLS_ENABLED" == "1" ]]; then
     log_info "DEPLOY + mTLS: the zone-level toggle MUST already be on:"
     log_info "  Cloudflare dashboard -> SSL/TLS -> Origin Server -> Authenticated Origin Pulls"
@@ -732,6 +825,7 @@ if [[ "$MODE" == "deploy" ]] && [[ "$MTLS_ENABLED" == "1" ]]; then
 fi
 
 # ---- Dry run ------------------------------------------------------------------------------
+# Fill the vhost template: each sed expression replaces one __PLACEHOLDER__.
 render_vhost() {
     sed \
         -e "s|__SERVER_NAME__|${SERVER_NAME}|g" \
@@ -741,6 +835,7 @@ render_vhost() {
         "${SCRIPT_DIR}/nginx/owntracks.conf.template"
 }
 
+# Emit the config file content from the final merged settings.
 render_config() {
     cat <<EOF
 # cf-owntracks daemon config — managed by installer (v${CFO_VERSION})
@@ -772,6 +867,8 @@ if (( DRY_RUN == 1 )); then
 fi
 
 # ---- Snapshot --------------------------------------------------------------------------------
+# Record the pre-install state of the firewall + nginx (+ old config) into a
+# timestamped directory, so there is always something to compare/restore from.
 take_install_snapshot() {
     local snap_dir
     snap_dir="${CFO_BACKUP_DIR}/$(date -u +%Y%m%dT%H%M%SZ)"
@@ -792,6 +889,8 @@ take_install_snapshot() {
 
 # ---- Install ----------------------------------------------------------------------------------
 install_files() {
+    # `install` = copy + set permissions/dirs in one step (-d makes dirs,
+    # -m sets the mode).
     log_info "installing libraries to /usr/local/lib/cf-owntracks/"
     install -d -m 0755 /usr/local/lib/cf-owntracks /usr/local/share/cf-owntracks
     install -m 0644 "${SCRIPT_DIR}/lib/common.sh"   /usr/local/lib/cf-owntracks/
@@ -807,6 +906,8 @@ install_files() {
     install -m 0644 "${SCRIPT_DIR}/systemd/cf-owntracks.service"     /etc/systemd/system/
     install -m 0644 "${SCRIPT_DIR}/systemd/cf-owntracks.timer"       /etc/systemd/system/
     install -m 0644 "${SCRIPT_DIR}/systemd/cf-owntracks-retry.timer" /etc/systemd/system/
+    # The shipped timer fires every 6 hours; patch its OnCalendar line in
+    # place when the operator picked something else.
     case "$REFRESH_INTERVAL" in
         6h)     : ;;  # shipped default
         3h)     sed -i 's|^OnCalendar=.*|OnCalendar=*-*-* 00/3:00:00|' /etc/systemd/system/cf-owntracks.timer ;;
@@ -826,12 +927,15 @@ install_files() {
 # cf-owntracks placeholder — overwritten by the daemon on first refresh.
 EOF
     if [[ "$MODE" == "deploy" ]]; then
+        # Deploy placeholder FAILS CLOSED: better to 403 everything for a
+        # moment than to expose the service before the real rules land.
         cat > "$CFO_NGINX_ENFORCE_SNIPPET" <<'EOF'
 # cf-owntracks placeholder — overwritten on first refresh.
 # Fail closed until the real allowlist arrives (deploy mode).
 return 403;
 EOF
     else
+        # Test placeholder does nothing: test mode must never block.
         cat > "$CFO_NGINX_ENFORCE_SNIPPET" <<'EOF'
 # cf-owntracks placeholder — overwritten on first refresh.
 # TEST MODE: nothing enforced, decision logging starts after first refresh.
@@ -840,6 +944,8 @@ EOF
     cat > "$CFO_NGINX_MTLS_SNIPPET" <<'EOF'
 # cf-owntracks placeholder — overwritten by the daemon on first refresh.
 EOF
+    # Minimal but syntactically-complete maps so nginx -t passes before the
+    # first refresh fills in the real classification data.
     cat > "$CFO_NGINX_MAPS_CONF" <<'EOF'
 # cf-owntracks placeholder — overwritten by the daemon on first refresh.
 geo $realip_remote_addr $cfo_src_class { default would_block; }
@@ -854,6 +960,7 @@ EOF
     log_info "rendering OwnTracks vhost"
     render_vhost > "$CFO_NGINX_VHOST"
     chmod 0644 "$CFO_NGINX_VHOST"
+    # sites-enabled entries are symlinks into sites-available (Debian custom).
     ln -sf "$CFO_NGINX_VHOST" "$CFO_NGINX_VHOST_ENABLED"
 
     if [[ "$GLOBAL_REDIRECT" == "1" ]]; then
@@ -875,6 +982,7 @@ EOF
     local a n
     for a in "${ARG_ALLOW[@]}"; do
         n="$(normalize_cidr "$a")"
+        # grep -qxF = exact whole-line match, no regex — "is it already there?"
         if ! grep -qxF "$n" "$CFO_ALLOWLIST_FILE" 2>/dev/null; then
             echo "$n" >> "$CFO_ALLOWLIST_FILE"
             log_info "allowlist: added $n"
@@ -888,6 +996,8 @@ take_install_snapshot
 install_files
 
 # ---- Bootstrap + enable ---------------------------------------------------------------------------
+# Run one refresh right now (synchronously) so the box is fully configured the
+# moment the installer exits — no waiting for the first timer tick.
 log_info "running initial refresh (synchronous bootstrap)"
 if ! /usr/local/sbin/cf-owntracks-refresh; then
     log_error "initial refresh failed; review: journalctl -t cf-owntracks -n 50"
@@ -899,6 +1009,7 @@ log_info "enabling refresh timer (${REFRESH_INTERVAL})"
 systemctl enable --now cf-owntracks.timer
 
 # ---- Diagnostics + summary -------------------------------------------------------------------------
+# `|| true`: a WARN-level diagnostic outcome shouldn't abort a completed install.
 run_diagnostics || true
 
 echo

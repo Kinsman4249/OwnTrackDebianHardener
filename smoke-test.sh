@@ -1,5 +1,9 @@
 #!/usr/bin/env bash
+# =============================================================================
 # cf-owntracks smoke test (v2 — mode-aware)
+#
+# (New to the bash idioms used here? See the guide at the top of
+#  lib/common.sh — every trick used below is explained there.)
 #
 # Local checks (run on the origin, as root):
 #   - systemd timer active + enabled; retry timer unit installed
@@ -26,18 +30,20 @@
 #   sudo ./smoke-test.sh --local-only
 #
 # Exit code: 0 if no FAILs.
+# =============================================================================
 
 set -Eeuo pipefail
 
+# ---- Defaults + argument parsing ---------------------------------------------
 SERVER_NAME=""
 ORIGIN_IP=""
-MODE_FLAG="all"
+MODE_FLAG="all"            # which suites to run: all | local-only | remote-only
 SKIP_DIRECT=0
-EXPECTED_MODE=""
+EXPECTED_MODE=""           # test | deploy — normally read from the config
 EXPECTED_MTLS=""
-TIMEOUT_DIRECT_DROP=6
+TIMEOUT_DIRECT_DROP=6      # how long to wait before calling a probe "dropped"
 
-usage() { sed -n '2,30p' "$0"; }
+usage() { sed -n '2,30p' "$0"; }   # help text = this file's own header comment
 
 while (( $# )); do
     case "$1" in
@@ -53,6 +59,8 @@ while (( $# )); do
     esac
 done
 
+# When run on the origin box, the installed config fills in whatever the
+# flags didn't specify.
 CFG="/etc/cf-owntracks/config"
 if [[ -r "$CFG" ]]; then
     # shellcheck disable=SC1090
@@ -69,7 +77,10 @@ if [[ "$MODE_FLAG" != "local-only" ]] && [[ -z "$SERVER_NAME" ]]; then
     exit 2
 fi
 
+# ---- Result counters + colored output ------------------------------------------
 PASS_COUNT=0; FAIL_COUNT=0; SKIP_COUNT=0
+# Only use ANSI colors when stdout is a terminal ([[ -t 1 ]]); piped output
+# stays plain. $'\e[32m' is bash's escape-sequence syntax for the color codes.
 if [[ -t 1 ]]; then
     C_OK=$'\e[32m'; C_FAIL=$'\e[31m'; C_SKIP=$'\e[33m'; C_DIM=$'\e[2m'; C_RST=$'\e[0m'
 else
@@ -80,12 +91,14 @@ fail() { printf '%s  FAIL%s  %s\n%s        %s%s\n' "$C_FAIL" "$C_RST" "$1" "$C_D
 skip() { printf '%s  SKIP%s  %s\n%s        %s%s\n' "$C_SKIP" "$C_RST" "$1" "$C_DIM" "${2:-}" "$C_RST"; SKIP_COUNT=$((SKIP_COUNT+1)); }
 section() { printf '\n%s== %s ==%s\n' "$C_DIM" "$1" "$C_RST"; }
 
-# TCP connect check without nc: bash /dev/tcp with timeout.
+# TCP connect check without netcat: bash's built-in /dev/tcp pseudo-device
+# opens a TCP connection when you redirect to it. `timeout 4` caps the wait.
 tcp_open() {
     local host="$1" port="$2"
     timeout 4 bash -c "exec 3<>/dev/tcp/${host}/${port}" 2>/dev/null
 }
 
+# ---- Local (on-box) checks --------------------------------------------------------
 run_local_checks() {
     if (( EUID != 0 )); then
         skip "local checks" "need root; rerun with sudo"
@@ -97,6 +110,7 @@ run_local_checks() {
         echo "  NOTE: TEST mode — enforcement is OFF by design; this host is observing only."
     fi
 
+    # systemd units: main timer running + enabled, retry timer at least installed.
     systemctl is-active cf-owntracks.timer >/dev/null 2>&1 \
         && pass "refresh timer active" || fail "refresh timer active" "$(systemctl is-active cf-owntracks.timer 2>&1 || true)"
     systemctl is-enabled cf-owntracks.timer >/dev/null 2>&1 \
@@ -106,6 +120,7 @@ run_local_checks() {
 
     [[ -r "$CFG" ]] && pass "config present at $CFG" || fail "config present" "missing"
 
+    # Last-known-good caches: their absence means no refresh ever succeeded.
     local v4f="/var/lib/cf-owntracks/ips-v4.last" v6f="/var/lib/cf-owntracks/ips-v6.last"
     [[ -s "$v4f" ]] && pass "published v4 cache ($(grep -c . "$v4f") ranges)" || fail "published v4 cache" "refresh never succeeded?"
     [[ -s "$v6f" ]] && pass "published v6 cache ($(grep -c . "$v6f") ranges)" || fail "published v6 cache" ""
@@ -115,6 +130,7 @@ run_local_checks() {
                         || skip "ASN failsafe cache" "not created yet"
     fi
 
+    # Every nginx piece the daemon manages must exist and be non-empty.
     local f
     for f in /etc/nginx/conf.d/cf-owntracks-maps.conf \
              /etc/nginx/snippets/cloudflare-realip.conf \
@@ -124,7 +140,8 @@ run_local_checks() {
     done
     nginx -t >/dev/null 2>&1 && pass "nginx -t" || fail "nginx -t" "$(nginx -t 2>&1 | tail -3)"
 
-    # Managed ports vs SSH ports.
+    # Managed ports vs SSH ports: read what the daemon recorded, re-derive the
+    # SSH set independently, and assert zero overlap.
     local managed="" ssh_ports="" p
     [[ -s /var/lib/cf-owntracks/ports.last ]] && managed="$(tr '\n' ' ' < /var/lib/cf-owntracks/ports.last)"
     ssh_ports="$( { sed -n 's/^[[:space:]]*[Pp]ort[[:space:]]\+\([0-9]\+\).*/\1/p' /etc/ssh/sshd_config 2>/dev/null; echo 22; } | sort -un | tr '\n' ' ')"
@@ -138,7 +155,7 @@ run_local_checks() {
         fail "managed ports recorded" "/var/lib/cf-owntracks/ports.last missing"
     fi
 
-    # SSH still answers locally (loopback path exercises the fw input hook).
+    # SSH still answers locally (the loopback path exercises the fw input hook).
     for p in $ssh_ports; do
         if tcp_open 127.0.0.1 "$p"; then
             pass "SSH port ${p} accepts connections"
@@ -147,13 +164,14 @@ run_local_checks() {
         fi
     done
 
-    # Listeners on managed ports.
+    # Something must be listening on each managed port (usually nginx).
     for p in $managed; do
         ss -ltn "( sport = :${p} )" 2>/dev/null | grep -q LISTEN \
             && pass "listener on :${p}" || fail "listener on :${p}" "nothing listening"
     done
 
-    # Firewall state.
+    # Firewall state, checked per backend — and in test mode, prove that the
+    # rules OBSERVE rather than block.
     case "${CFO_FW_BACKEND:-}" in
         nftables)
             if nft list table inet cf_owntracks >/dev/null 2>&1; then
@@ -181,7 +199,7 @@ run_local_checks() {
             ;;
     esac
 
-    # Decision log (test mode).
+    # Decision log (test mode): the last line must look like our NDJSON.
     if [[ "$EXPECTED_MODE" == "test" ]]; then
         local dlog="/var/log/cf-owntracks/decisions.ndjson"
         if [[ -s "$dlog" ]]; then
@@ -196,14 +214,19 @@ run_local_checks() {
         fi
     fi
 
+    # Did a refresh succeed recently?
     journalctl -u cf-owntracks.service --since '1 day ago' 2>/dev/null | grep -q 'refresh complete' \
         && pass "refresh succeeded within 24h" \
         || skip "refresh succeeded within 24h" "run: sudo systemctl start cf-owntracks.service"
 }
 
+# ---- Remote (network) checks -------------------------------------------------------
 run_remote_checks() {
     section "Remote (network) checks  [$SERVER_NAME]  expected mode: ${EXPECTED_MODE^^}"
 
+    # 1. The normal end-user path: HTTPS through Cloudflare's DNS/proxy.
+    # curl -w '%{http_code}' prints just the status code; -o /dev/null
+    # discards the body. "000" = the request never completed.
     local code
     code=$(curl -sS --max-time 15 -o /dev/null -w '%{http_code}' "https://${SERVER_NAME}/" 2>/dev/null || echo "000")
     case "$code" in
@@ -212,6 +235,7 @@ run_remote_checks() {
         *)       fail "https via CF returns 2xx/3xx" "got $code" ;;
     esac
 
+    # 2. Plain HTTP through Cloudflare must bounce to HTTPS.
     code=$(curl -sS --max-time 15 -o /dev/null -w '%{http_code}' "http://${SERVER_NAME}/" 2>/dev/null || echo "000")
     case "$code" in
         301|302|307|308) pass "http via CF redirects ($code)" ;;
@@ -219,6 +243,9 @@ run_remote_checks() {
         *)               fail "http via CF redirects" "got $code (expected 301)" ;;
     esac
 
+    # 3. Direct-to-origin probes: connect to the origin IP while sending the
+    # right hostname (--resolve pins DNS), i.e. pretend Cloudflare isn't there.
+    # What SHOULD happen depends entirely on the mode.
     if (( SKIP_DIRECT == 1 )); then
         skip "direct-to-origin checks" "--skip-direct"
         return 0
@@ -231,15 +258,18 @@ run_remote_checks() {
     local errfile body err
     errfile="$(mktemp)"
     body=$(curl -sS --max-time 10 --resolve "${SERVER_NAME}:443:${ORIGIN_IP}" -o /dev/null -w '%{http_code}' "https://${SERVER_NAME}/" 2>"$errfile" || true)
-    err="$(<"$errfile")"; rm -f "$errfile"
+    err="$(<"$errfile")"; rm -f "$errfile"     # $(<file) = read file contents
 
     if [[ "$EXPECTED_MODE" == "test" ]]; then
+        # Test mode must not block — a successful response is the PASS.
         case "$body" in
             2??|3??) pass "TEST: direct https to origin succeeds ($body) — will appear in decision log as would_block" ;;
             *)       fail "TEST: direct https to origin succeeds" "got code=$body err=${err:0:100} (test mode must not block)" ;;
         esac
     else
         if [[ "$EXPECTED_MTLS" == "1" ]]; then
+            # Deploy + mTLS: we're not a Cloudflare edge, so either the TLS
+            # handshake fails outright or nginx answers 403.
             if [[ "$body" == "000" ]] && grep -qiE 'handshake|certificate|alert' <<<"$err"; then
                 pass "DEPLOY+mTLS: direct https fails TLS (${err%%$'\n'*})"
             elif [[ "$body" == "403" ]]; then
@@ -254,6 +284,8 @@ run_remote_checks() {
         fi
     fi
 
+    # 4. Direct HTTP to the origin: deploy mode should DROP it at the firewall
+    # (curl times out), test mode should answer with the redirect.
     errfile="$(mktemp)"
     body=$(curl -sS --max-time "$TIMEOUT_DIRECT_DROP" --resolve "${SERVER_NAME}:80:${ORIGIN_IP}" -o /dev/null -w '%{http_code}' "http://${SERVER_NAME}/" 2>"$errfile" || true)
     err="$(<"$errfile")"; rm -f "$errfile"
@@ -274,6 +306,7 @@ run_remote_checks() {
     fi
 }
 
+# ---- Dispatch + summary --------------------------------------------------------------
 case "$MODE_FLAG" in
     local-only)  run_local_checks ;;
     remote-only) run_remote_checks ;;
@@ -285,4 +318,5 @@ echo "------------------------------------------------------------"
 printf '%s%d PASS%s   %s%d FAIL%s   %s%d SKIP%s\n' \
     "$C_OK" "$PASS_COUNT" "$C_RST" "$C_FAIL" "$FAIL_COUNT" "$C_RST" "$C_SKIP" "$SKIP_COUNT" "$C_RST"
 
+# The script's exit code IS the verdict: 0 only when nothing FAILed.
 (( FAIL_COUNT == 0 ))
