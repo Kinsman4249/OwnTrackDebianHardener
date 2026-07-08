@@ -49,6 +49,37 @@ entry in `/etc/cf-owntracks/allowlist`.
 **Never touched:** SSH and every other non-managed port — see the guarantee
 below.
 
+## Get the code
+
+First install — clone the repo onto the Debian 12 box:
+
+```sh
+sudo apt-get install -y git          # if git isn't there yet
+git clone https://github.com/Kinsman4249/OwnTrackDebianHardener.git
+cd OwnTrackDebianHardener
+chmod +x install.sh uninstall.sh smoke-test.sh bin/cf-owntracks-refresh
+```
+
+Updating an existing clone to the latest version:
+
+```sh
+cd OwnTrackDebianHardener
+git pull
+chmod +x install.sh uninstall.sh smoke-test.sh bin/cf-owntracks-refresh
+sudo ./install.sh        # re-run; your settings are the defaults
+```
+
+To pin a specific release instead of `main`: `git checkout v2.1.0`
+(or `git pull --tags && git checkout v2.1.0` on an existing clone).
+
+No git? Grab a release tarball:
+
+```sh
+curl -L https://github.com/Kinsman4249/OwnTrackDebianHardener/archive/refs/tags/v2.1.0.tar.gz | tar xz
+cd OwnTrackDebianHardener-2.1.0
+chmod +x install.sh uninstall.sh smoke-test.sh bin/cf-owntracks-refresh
+```
+
 ## Install
 
 ```sh
@@ -286,7 +317,14 @@ sudo ./smoke-test.sh                                        # on origin
 
 ## Upgrading from 1.x
 
-Run the v2 installer. It reads your 1.x config as prompt defaults (nothing is
+```sh
+cd OwnTrackDebianHardener
+git pull
+chmod +x install.sh uninstall.sh smoke-test.sh bin/cf-owntracks-refresh
+sudo ./install.sh
+```
+
+The installer reads your 1.x config as prompt defaults (nothing is
 clobbered), removes v1 leftovers, and — because v2 defaults to test mode —
 prints a prominent notice that **enforcement is being switched OFF** until
 you re-run with `--deploy`. Fixes shipped in 2.0.0 that affected v1:
