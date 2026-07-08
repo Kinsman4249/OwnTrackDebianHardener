@@ -3,7 +3,7 @@
 **Version 2.3.0**
 
 A Debian 12 daemon that locks down an **nginx deployment** so only Cloudflare
-can reach it — a dynamic nginx + firewall allowlist driven by Cloudflare's own
+can reach it - a dynamic nginx + firewall allowlist driven by Cloudflare's own
 published IP ranges, with Authenticated Origin Pulls (mTLS) on by default. It
 works for **any HTTP/HTTPS service you serve through nginx and front with
 Cloudflare**; it just ships **OwnTracks-flavoured defaults** for the settings
@@ -16,15 +16,15 @@ decision log before you enforce anything.
 
 The internal commands and config paths keep a short `cf-owntracks` prefix
 (`cf-owntracks-refresh`, `/etc/cf-owntracks/config`, `inet cf_owntracks`
-nftables table, etc.) — these are the stable runtime identifiers and are
+nftables table, etc.) - these are the stable runtime identifiers and are
 deliberately unchanged by the rename. The project/repo name is
 **CloudFlareDebianHardener-OwnTrackFlavoured**; "OwnTracks-flavoured" signals
 that the OwnTracks case is the best-trodden path, not the only one.
 
-> **⚠ v2 breaking change:** running `install.sh` now defaults to **TEST mode**
+> ** v2 breaking change:** running `install.sh` now defaults to **TEST mode**
 > (nothing enforces). Pass `--deploy` for the enforcing behavior that v1
 > applied by default. Upgrading over a 1.x install switches that system back
-> to test mode and tells you so — re-run with `--deploy` to re-enforce.
+> to test mode and tells you so - re-run with `--deploy` to re-enforce.
 
 ## The two modes
 
@@ -33,7 +33,7 @@ that the OwnTracks case is the best-trodden path, not the only one.
 | Firewall | logs + counts would-blocked traffic, **drops nothing** | drops non-Cloudflare traffic on managed ports |
 | nginx | classifies every request, **rejects nothing** | returns 403 to anything not Cloudflare/localhost/allowlisted |
 | mTLS (AOP) | verified `optional`, result recorded | required (via the 403 gate) for non-allowlisted sources |
-| Decision log | **on** — every request → NDJSON | off |
+| Decision log | **on** - every request -> NDJSON | off |
 | IP ranges | refreshed continuously | refreshed continuously |
 
 Both modes run the full daemon + timer, so ranges/ports/allowlist stay current
@@ -48,7 +48,7 @@ sudo ./install.sh --yes              # back to observing
 
 | Layer | Mechanism | What it stops |
 |------|-----------|---------------|
-| L3 firewall | nft / ufw / iptables — scoped to the **managed ports only** | Non-Cloudflare, non-allowlisted sources can't reach the ports |
+| L3 firewall | nft / ufw / iptables - scoped to the **managed ports only** | Non-Cloudflare, non-allowlisted sources can't reach the ports |
 | L7 nginx gate | geo classification + 403 (post-`set_real_ip_from`) | Belt-and-suspenders for L3 |
 | L7 mTLS | Authenticated Origin Pulls, `ssl_verify_client optional` + conditional 403 | Even a spoofed/reassigned CF IP fails without a real edge certificate |
 | App | OwnTracks recorder bound to `127.0.0.1` | No direct exposure even if every layer above fails |
@@ -56,10 +56,10 @@ sudo ./install.sh --yes              # back to observing
 **Always allowed, both modes, both layers:** loopback/localhost, and every
 entry in `/etc/cf-owntracks/allowlist`.
 
-**Never touched:** SSH and every other non-managed port — see the guarantee
+**Never touched:** SSH and every other non-managed port - see the guarantee
 below.
 
-## Beyond OwnTracks — what else this hardens
+## Beyond OwnTracks - what else this hardens
 
 OwnTracks is what this was built for, but nothing in the core is
 OwnTracks-specific. Underneath, it solves one general problem:
@@ -67,15 +67,15 @@ OwnTracks-specific. Underneath, it solves one general problem:
 > **"My service sits behind Cloudflare. How do I stop attackers from skipping
 > Cloudflare and hitting my origin IP directly?"**
 
-Every mechanism — firewall scoped to the nginx ports, `set_real_ip_from` +
+Every mechanism - firewall scoped to the nginx ports, `set_real_ip_from` +
 allow/deny keyed on the real connecting IP, Authenticated Origin Pulls (mTLS),
-the decision log — applies to **any HTTP/HTTPS service you serve through nginx
+the decision log - applies to **any HTTP/HTTPS service you serve through nginx
 and front with Cloudflare.** Only three things carry an OwnTracks flavor, and
 all are overridable:
 
 - Server-name auto-detection checks `/etc/default/ot-recorder` first (then
-  nginx `server_name`, then reverse DNS) — pass `--server-name` to skip it.
-- The default backend port is `8083` (the recorder) — pass `--owntracks-port`
+  nginx `server_name`, then reverse DNS) - pass `--server-name` to skip it.
+- The default backend port is `8083` (the recorder) - pass `--owntracks-port`
   for your app's local port.
 - Names like `cf-owntracks` in paths and the nftables table are cosmetic.
 
@@ -83,9 +83,9 @@ all are overridable:
 
 Anything self-hosted that you've put an orange cloud in front of:
 
-- Dashboards / admin panels — Grafana, Portainer, Uptime Kuma, Pi-hole or
+- Dashboards / admin panels - Grafana, Portainer, Uptime Kuma, Pi-hole or
   AdGuard admin
-- Self-hosted apps — Nextcloud, Gitea/Forgejo, Vaultwarden, Home Assistant,
+- Self-hosted apps - Nextcloud, Gitea/Forgejo, Vaultwarden, Home Assistant,
   n8n, Immich
 - APIs and webhook receivers where Cloudflare's WAF / rate-limiting must be
   unbypassable
@@ -95,14 +95,14 @@ Two ways to point it at them:
 
 - **You already have an nginx vhost:** `--attach-vhost
   /etc/nginx/sites-enabled/<yoursite>` layers the protection into it and leaves
-  everything else alone (the recommended path — same as the OwnTracks flow).
+  everything else alone (the recommended path - same as the OwnTracks flow).
 - **You want the tool to own the vhost:** run without `--attach-vhost` and give
   it `--server-name app.example.com --owntracks-port <your-backend-port>`; it
   generates a vhost proxying to `127.0.0.1:<port>`.
 
 ### Protecting several services at once
 
-`--attach-vhost` is **repeatable**, and the set is **additive + persistent** —
+`--attach-vhost` is **repeatable**, and the set is **additive + persistent** - 
 so adding another service is easy, interactively or not:
 
 ```sh
@@ -117,7 +117,7 @@ sudo bash install.sh --attach-vhost /etc/nginx/sites-enabled/gitea --yes
 ```
 
 Run the installer with no flags and it **prompts** for each setting, then loops:
-`Protect an existing nginx vhost file? path (blank = done)` — enter as many as
+`Protect an existing nginx vhost file? path (blank = done)`- enter as many as
 you like. Whatever you add persists in `CFO_ATTACH_VHOST` and is reused on every
 future run. Each vhost gets the include stanza in every one of its server
 blocks; managed-port discovery reads the `listen` directives of all of them; and
@@ -128,31 +128,31 @@ To stop protecting one service, remove its path from `CFO_ATTACH_VHOST` in
 place until then; delete the marker block by hand if you want them gone
 immediately), or `--uninstall` to detach from all.
 
-One `cf-owntracks` daemon covers every attached vhost — there's no need to run
+One `cf-owntracks` daemon covers every attached vhost - there's no need to run
 multiple instances.
 
 ### Requirements and limits (read before repurposing)
 
 - **The hostname must actually be proxied by Cloudflare** (orange cloud). The
-  whole model is "only Cloudflare may reach the origin" — if the record is
+  whole model is "only Cloudflare may reach the origin" - if the record is
   grey-clouded/direct, deploy mode will 403 your real users. Test mode shows
   them all as `would_block` first, which is exactly your safety net: watch the
   decision log before enforcing.
 - **HTTP/HTTPS through nginx only.** The L7 layer (real-IP, 403 gate, mTLS,
   decision log) needs nginx in front of the service. A raw non-HTTP port
-  (MQTT, Postgres, a game server) isn't the target — you *can* firewall-gate an
+  (MQTT, Postgres, a game server) isn't the target - you *can* firewall-gate an
   extra port to Cloudflare IPs with `--manage-port`, but that only makes sense
   if you proxy it through **Cloudflare Spectrum**; plain Cloudflare proxies
   only HTTP/HTTPS, so gating a non-proxied port to CF IPs would just block
   everyone.
 - **This is not a WAF.** It doesn't inspect payloads or block attack patterns.
   It guarantees traffic *reaches* your origin only via Cloudflare, so
-  Cloudflare's WAF, rules, and rate-limits can't be sidestepped — it's the
+  Cloudflare's WAF, rules, and rate-limits can't be sidestepped - it's the
   enforcement half of "Cloudflare in front"; the intelligence stays in
   Cloudflare.
-- **mTLS still needs the zone-level toggle** (SSL/TLS → Origin Server →
+- **mTLS still needs the zone-level toggle** (SSL/TLS -> Origin Server -> 
   Authenticated Origin Pulls), exactly as for OwnTracks.
-- **SSH and every non-managed port are never touched** — that guarantee holds
+- **SSH and every non-managed port are never touched** - that guarantee holds
   no matter which app you point this at.
 
 In short: if "only Cloudflare should be able to reach this origin" is true for
@@ -161,7 +161,7 @@ service it was pointed at.
 
 ## Get the code
 
-First install — clone the repo onto the Debian 12 box:
+First install - clone the repo onto the Debian 12 box:
 
 ```sh
 sudo apt-get install -y git          # if git isn't there yet
@@ -175,7 +175,7 @@ chmod +x install.sh uninstall.sh smoke-test.sh bin/cf-owntracks-refresh
 ```
 
 > **Tip:** you can skip both the `core.fileMode` and `chmod` lines entirely by
-> invoking the scripts with `bash` — e.g. `sudo bash install.sh` — which
+> invoking the scripts with `bash`- e.g. `sudo bash install.sh`- which
 > doesn't care about the executable bit.
 
 Updating an existing clone to the latest version:
@@ -208,20 +208,20 @@ sudo ./install.sh
 That's it for a first look: the installer **prompts for every setting**
 (server name, cert/key paths, recorder port, mTLS, redirect, refresh interval,
 log cap, extra allowlist IPs), showing defaults you can accept with Enter.
-On a box with a previous install, **your existing settings are the defaults —
+On a box with a previous install, **your existing settings are the defaults - 
 nothing is clobbered.**
 
 Two things it works out on its own:
 
-- **Server name** — when you don't pass `--server-name` (and no prior config
+- **Server name** - when you don't pass `--server-name` (and no prior config
   exists), it tries three sources in order: the **OwnTracks recorder's own
-  config** (`/etc/default/ot-recorder` — URL-shaped values like
+  config** (`/etc/default/ot-recorder`- URL-shaped values like
   `OTR_HTTPPREFIX` first, then an FQDN-valued `OTR_HOST`; the recorder knows
   the public URL it serves under, so this beats inference), then nginx
   `server_name` directives, then the reverse-DNS PTR of the box's public IP.
-  Always shown as a prompt default, never applied silently — PTR names in
+  Always shown as a prompt default, never applied silently - PTR names in
   particular are often generic ISP hostnames.
-- **The origin certificate** — see the next section.
+- **The origin certificate** - see the next section.
 
 Non-interactive (with automatic cert):
 
@@ -244,33 +244,33 @@ Instead of supplying `--cert`/`--key`, let the installer provision a
    (key mode 0600). A still-valid existing cert covering the hostname
    (>30 days left) is **reused, not reissued**.
 
-#### Credentials — exactly what the key needs
+#### Credentials - exactly what the key needs
 
 One of the two, preferably via environment variable (invisible to `ps`):
 
-**Option A — Origin CA Key (`CF_ORIGIN_CA_KEY`, recommended)**
+**Option A - Origin CA Key (`CF_ORIGIN_CA_KEY`, recommended)**
 
-- **Where:** Cloudflare dashboard → **My Profile → API Tokens** → scroll to
-  the **API Keys** section → **Origin CA Key** → View. It looks like
+- **Where:** Cloudflare dashboard -> **My Profile -> API Tokens** -> scroll to
+  the **API Keys** section -> **Origin CA Key** -> View. It looks like
   `v1.0-xxxxxxxx...`.
 - **What it can do:** issue and revoke Origin CA certificates for zones on
-  your account — *and nothing else*. It cannot touch DNS, zone settings,
+  your account - *and nothing else*. It cannot touch DNS, zone settings,
   firewall rules, or billing. That built-in narrowness is why it's the
   recommended option.
 
-**Option B — API Token (`CF_API_TOKEN`)**
+**Option B - API Token (`CF_API_TOKEN`)**
 
-Create at **My Profile → API Tokens → Create Token → Custom token** with
+Create at **My Profile -> API Tokens -> Create Token -> Custom token** with
 exactly this permission set:
 
 | Setting | Value |
 |---|---|
-| Permissions | **Zone → SSL and Certificates → Edit** (Edit, not Read — issuing a cert is a write) |
-| Zone Resources | **Include → Specific zone →** the zone your server name lives in |
-| Client IP Address Filtering | leave empty, or include the **origin server's public IP** — the API call is made *from the origin box* |
+| Permissions | **Zone -> SSL and Certificates -> Edit** (Edit, not Read - issuing a cert is a write) |
+| Zone Resources | **Include -> Specific zone -> ** the zone your server name lives in |
+| Client IP Address Filtering | leave empty, or include the **origin server's public IP** - the API call is made *from the origin box* |
 | TTL | optional; see note below |
 
-Nothing else is required — no DNS permissions, no account-level permissions,
+Nothing else is required - no DNS permissions, no account-level permissions,
 no additional zones.
 
 **Credential hygiene notes**
@@ -282,7 +282,7 @@ no additional zones.
   instead of calling the API, you can safely give an API token a short TTL
   or delete it right after installing.
 - If the API answers `Auth error` / `9109`: wrong credential type for the
-  auth header (Origin CA keys and API tokens are not interchangeable — the
+  auth header (Origin CA keys and API tokens are not interchangeable - the
   installer picks the header by the `v1.0-` prefix), missing the Edit
   permission, the zone isn't included in the token's scope, or IP filtering
   is excluding the origin box.
@@ -291,14 +291,14 @@ In interactive installs the installer offers auto-provisioning whenever no
 usable cert path is configured, and asks for the credential with hidden
 input. Non-interactively, having a credential in the environment with no
 `--cert` configured enables it automatically. Because these are Origin CA
-certs, they're only trusted by Cloudflare — direct-access clients (your
+certs, they're only trusted by Cloudflare - direct-access clients (your
 allowlisted IPs) will see an untrusted-cert warning, exactly as covered in
 the allowlist section.
 
 The install finishes with an **install summary + diagnostics block** that
 checks: Cloudflare endpoints (ips-v4/v6, origin-pull CA, RIPEstat), journald
 write/read, `nginx -t`, listeners on every managed port, firewall rule
-presence, the port→SSH exclusion proof, and state/log directory access —
+presence, the port -> SSH exclusion proof, and state/log directory access - 
 each line PASS/WARN/FAIL. Re-run it anytime:
 
 ```sh
@@ -307,8 +307,8 @@ sudo ./install.sh --diagnostics
 
 ### Already have an nginx vhost for this host? Use `--attach-vhost`
 
-If your box already serves the OwnTracks hostname through its own vhost —
-basic-auth, PHP frontend, custom `location` blocks, the works — **don't let
+If your box already serves the OwnTracks hostname through its own vhost - 
+basic-auth, PHP frontend, custom `location` blocks, the works - **don't let
 the installer generate a competing one**. Two vhosts claiming the same
 `server_name` make nginx silently ignore one of them ("conflicting server
 name"), and whichever loses serves nothing.
@@ -322,17 +322,17 @@ sudo bash install.sh --attach-vhost /etc/nginx/sites-enabled/owntracks --yes
 What it does:
 
 - Injects exactly three `include` lines (realip, mTLS, enforce) into each
-  `server` block of your file, wrapped in marker comments — **idempotent**
+  `server` block of your file, wrapped in marker comments - **idempotent**
   (re-runs detect the markers and do nothing) and **reversible**
   (`--uninstall` removes exactly that stanza; a one-time backup lands at
   `<file>.pre-cfo`).
 - Removes any previously-generated standalone vhost so nothing competes.
-- Persists the path in config (`CFO_ATTACH_VHOST`) — every future installer
+- Persists the path in config (`CFO_ATTACH_VHOST`) - every future installer
   run reuses it automatically.
 - Managed-port discovery reads *your* vhost's `listen` directives.
 - Validates with `nginx -t` after injecting; restores your file on failure.
 
-Your auth, routing, cookies, and locations are untouched — you just gain the
+Your auth, routing, cookies, and locations are untouched - you just gain the
 decision log, real-IP handling, mTLS verification, and (in deploy mode) the
 Cloudflare-only 403 gate, inside the vhost that actually serves traffic.
 
@@ -348,16 +348,16 @@ mean it).
 | `--deploy` | test mode | Enforce. Without it you're observing only |
 | `--attach-vhost <file>` | off | Layer includes into an existing vhost instead of generating one (persisted; see above) |
 | `--force-own-vhost` | off | Generate our vhost despite a detected server-name conflict (not recommended) |
-| `--server-name <host>` | auto-detect | Public FQDN (auto: OwnTracks config → nginx `server_name` → reverse-DNS PTR) |
+| `--server-name <host>` | auto-detect | Public FQDN (auto: OwnTracks config -> nginx `server_name` -> reverse-DNS PTR) |
 | `--cert <path> --key <path>` | prompt/config | TLS material (or use `--cf-auto-cert`) |
 | `--cf-auto-cert` | off | Provision a 15-year Origin CA cert via the Cloudflare API |
 | `--cf-origin-ca-key <k>` / `--cf-api-token <t>` | env | Credentials for `--cf-auto-cert` (prefer `CF_ORIGIN_CA_KEY` / `CF_API_TOKEN` env vars) |
 | `--owntracks-port <port>` | `8083` | Local recorder port |
-| `--allow <ip-or-cidr>` | — | Always-allow this source (repeatable; persisted) |
+| `--allow <ip-or-cidr>` | - | Always-allow this source (repeatable; persisted) |
 | `--no-mtls` | mTLS on | Disable Authenticated Origin Pulls |
 | `--no-asn-failsafe` | on | Disable the ASN prefix failsafe |
 | `--asns "<a> <b>"` | `13335` | Cloudflare ASNs for the failsafe |
-| `--manage-port <port>` | — | Opt another nginx port into management (repeatable) |
+| `--manage-port <port>` | - | Opt another nginx port into management (repeatable) |
 | `--global-http-redirect` | off | default_server on :80 that 301s all unmatched hosts |
 | `--refresh-interval <v>` | `6h` | `6h` / `3h` / `12h` / `daily` / `hourly` |
 | `--test-log-max-mb <n>` | `15` | Decision log size cap |
@@ -371,14 +371,14 @@ mean it).
 
 Enable the zone-level toggle **before** deploying with mTLS on:
 
-> Cloudflare dashboard → SSL/TLS → Origin Server → **Authenticated Origin Pulls**
+> Cloudflare dashboard -> SSL/TLS -> Origin Server -> **Authenticated Origin Pulls**
 
 The installer refuses to deploy with mTLS until you confirm this. (In test
-mode there's nothing to break — verification is recorded, never required.)
+mode there's nothing to break - verification is recorded, never required.)
 
 ## The decision log (test mode)
 
-Every request lands in `/var/log/cf-owntracks/decisions.ndjson` — one JSON
+Every request lands in `/var/log/cf-owntracks/decisions.ndjson`- one JSON
 object per line, so it's grep-able by humans and trivially parseable by
 machines:
 
@@ -420,13 +420,13 @@ sudo systemctl start cf-owntracks.service   # or wait ≤6h for the next tick
 ```
 
 One IP or CIDR per line, `#` comments allowed, IPv4 and IPv6 both fine. These
-sources are always allowed on the managed ports — firewall **and** nginx,
+sources are always allowed on the managed ports - firewall **and** nginx,
 both modes. Matching uses the **physical connection address**, which can't be
 spoofed via `CF-Connecting-IP`/`X-Forwarded-For`.
 
 **Direct-access TLS note:** allowlisted clients hitting the origin directly
 will get an *untrusted certificate* warning if you serve a Cloudflare Origin
-CA cert (it isn't publicly trusted) — that's expected; use `curl -k`, import
+CA cert (it isn't publicly trusted) - that's expected; use `curl -k`, import
 the CF root, or serve a publicly trusted cert.
 
 ## Port scope + the SSH guarantee
@@ -439,15 +439,15 @@ diagnostics but never touched unless you opt them in with `--manage-port`.
 SSH can't be caught in the blast radius, by four independent layers:
 
 1. SSH ports are detected from `sshd_config` (+ `sshd_config.d/`) *and* live
-   `sshd` listeners — and **hard-subtracted** from the managed port set.
+   `sshd` listeners - and **hard-subtracted** from the managed port set.
    If nginx ever listens on an SSH port, SSH wins and you get a loud warning.
-2. The firewall chain starts with an explicit early `return` for SSH ports —
+2. The firewall chain starts with an explicit early `return` for SSH ports - 
    insurance against any port-list bug.
 3. Loopback is exempted before any verdict logic (`iif lo`).
 4. Diagnostics and the smoke test print the port map and assert the managed
    set contains no SSH port.
 
-Everything else on the box — every port not in the managed set — is simply
+Everything else on the box - every port not in the managed set - is simply
 never referenced by any rule this tool writes.
 
 ## ASN failsafe
@@ -463,14 +463,14 @@ Expect the novel set to be sizeable: as of mid-2026, AS13335 announces ~2400
 IPv4 + ~2900 IPv6 prefixes, of which roughly **930 aren't covered** by the
 published lists (including Cloudflare-operated space like `1.1.1.0/24`).
 nftables absorbs that effortlessly; on **ufw** it means thousands of discrete
-rules — use `--force nftables` or `--no-asn-failsafe` there.
+rules - use `--force nftables` or `--no-asn-failsafe` there.
 
 Trade-off to know about: AS13335 also announces BYOIP/Magic-Transit customer
 prefixes, so the failsafe widens the IP surface. Mitigations: the novel-only
 filter and diagnostics keep the addition visible (exact counts printed),
 deploy-mode mTLS still requires a real edge certificate regardless of IP, and
 `--no-asn-failsafe` turns it off entirely. A failed or implausible ASN lookup
-(>2000 novel prefixes) never fails a refresh — it degrades to the cached set.
+(>2000 novel prefixes) never fails a refresh - it degrades to the cached set.
 
 ## Autonomous refresh
 
@@ -480,7 +480,7 @@ deploy-mode mTLS still requires a real edge certificate regardless of IP, and
 - Every run re-derives: published ranges, ASN prefixes, origin-pull CA,
   managed ports (from nginx), and the allowlist
 - All updates are transactional: `nginx -t` gate + full rollback (snippets,
-  CA, firewall) on any failure — a failed run leaves the previous good state
+  CA, firewall) on any failure - a failed run leaves the previous good state
 
 Steady state needs **zero sysadmin action**.
 
@@ -518,7 +518,7 @@ sudo bash install.sh
 ```
 
 The installer reads your 1.x config as prompt defaults (nothing is
-clobbered), removes v1 leftovers, and — because v2 defaults to test mode —
+clobbered), removes v1 leftovers, and - because v2 defaults to test mode - 
 prints a prominent notice that **enforcement is being switched OFF** until
 you re-run with `--deploy`. Fixes shipped in 2.0.0 that affected v1:
 
@@ -532,32 +532,32 @@ you re-run with `--deploy`. Fixes shipped in 2.0.0 that affected v1:
 
 ## Troubleshooting
 
-**Nothing in the decision log** — no traffic has hit the vhost yet (or you're
+**Nothing in the decision log** - no traffic has hit the vhost yet (or you're
 in deploy mode, where the log is off). Check `nginx -t`, the listener, and CF
 DNS. `sudo ./install.sh --diagnostics` covers all of it.
 
-**Every request 403s after `--deploy` with mTLS** — the zone toggle
-(SSL/TLS → Origin Server → Authenticated Origin Pulls) is off, so Cloudflare
+**Every request 403s after `--deploy` with mTLS** - the zone toggle
+(SSL/TLS -> Origin Server -> Authenticated Origin Pulls) is off, so Cloudflare
 isn't presenting the edge certificate. Turn it on; effect is near-instant.
 The decision log (rerun test mode) would show `mtls_no_valid_cert`.
 
-**Let's Encrypt HTTP-01 renewal fails (deploy mode)** — LE's challenge IPs
+**Let's Encrypt HTTP-01 renewal fails (deploy mode)** - LE's challenge IPs
 aren't Cloudflare's. Use DNS-01, a Cloudflare Origin CA cert (15-year, no
 renewal traffic), or temporarily add LE to the allowlist.
 
-**Locked out of SSH** — not by this tool: SSH ports are hard-excluded and
+**Locked out of SSH** - not by this tool: SSH ports are hard-excluded and
 the smoke test proves it. Check your provider's edge firewall or your own
 `ufw`/`nft` policy.
 
-**`git pull` says "Your local changes … would be overwritten by merge"**
-(listing `install.sh`, `uninstall.sh`, etc.) — you ran `chmod +x` during
+**`git pull` says "Your local changes ... would be overwritten by merge"**
+(listing `install.sh`, `uninstall.sh`, etc.) - you ran `chmod +x` during
 setup, and git treats the executable-bit flip as a local modification.
 Run `git config core.fileMode false` once in the clone, then `git pull`
-again. It's harmless — it only tells git to stop comparing executable bits.
+again. It's harmless - it only tells git to stop comparing executable bits.
 Watch for this one: if the pull aborts, the fix you were pulling never
 installed, so a re-run of the installer will reproduce the *old* failure.
 
-**ufw is slow / rule list is huge** — the ASN failsafe multiplies ufw's
+**ufw is slow / rule list is huge** - the ASN failsafe multiplies ufw's
 per-CIDR rules. `--force nftables` (interval sets) handles the full merged
 set effortlessly, or `--no-asn-failsafe`.
 
