@@ -49,6 +49,78 @@ entry in `/etc/cf-owntracks/allowlist`.
 **Never touched:** SSH and every other non-managed port — see the guarantee
 below.
 
+## Beyond OwnTracks — what else this hardens
+
+OwnTracks is what this was built for, but nothing in the core is
+OwnTracks-specific. Underneath, it solves one general problem:
+
+> **"My service sits behind Cloudflare. How do I stop attackers from skipping
+> Cloudflare and hitting my origin IP directly?"**
+
+Every mechanism — firewall scoped to the nginx ports, `set_real_ip_from` +
+allow/deny keyed on the real connecting IP, Authenticated Origin Pulls (mTLS),
+the decision log — applies to **any HTTP/HTTPS service you serve through nginx
+and front with Cloudflare.** Only three things carry an OwnTracks flavor, and
+all are overridable:
+
+- Server-name auto-detection checks `/etc/default/ot-recorder` first (then
+  nginx `server_name`, then reverse DNS) — pass `--server-name` to skip it.
+- The default backend port is `8083` (the recorder) — pass `--owntracks-port`
+  for your app's local port.
+- Names like `cf-owntracks` in paths and the nftables table are cosmetic.
+
+### Good fits
+
+Anything self-hosted that you've put an orange cloud in front of:
+
+- Dashboards / admin panels — Grafana, Portainer, Uptime Kuma, Pi-hole or
+  AdGuard admin
+- Self-hosted apps — Nextcloud, Gitea/Forgejo, Vaultwarden, Home Assistant,
+  n8n, Immich
+- APIs and webhook receivers where Cloudflare's WAF / rate-limiting must be
+  unbypassable
+- Static sites, or anything else nginx serves for a Cloudflare-proxied hostname
+
+Two ways to point it at them:
+
+- **You already have an nginx vhost:** `--attach-vhost
+  /etc/nginx/sites-enabled/<yoursite>` layers the protection into it and leaves
+  everything else alone (the recommended path — same as the OwnTracks flow).
+- **You want the tool to own the vhost:** run without `--attach-vhost` and give
+  it `--server-name app.example.com --owntracks-port <your-backend-port>`; it
+  generates a vhost proxying to `127.0.0.1:<port>`.
+
+Run one instance per box; multiple server blocks in an attached vhost (and
+`--manage-port`) let it cover several sites at once.
+
+### Requirements and limits (read before repurposing)
+
+- **The hostname must actually be proxied by Cloudflare** (orange cloud). The
+  whole model is "only Cloudflare may reach the origin" — if the record is
+  grey-clouded/direct, deploy mode will 403 your real users. Test mode shows
+  them all as `would_block` first, which is exactly your safety net: watch the
+  decision log before enforcing.
+- **HTTP/HTTPS through nginx only.** The L7 layer (real-IP, 403 gate, mTLS,
+  decision log) needs nginx in front of the service. A raw non-HTTP port
+  (MQTT, Postgres, a game server) isn't the target — you *can* firewall-gate an
+  extra port to Cloudflare IPs with `--manage-port`, but that only makes sense
+  if you proxy it through **Cloudflare Spectrum**; plain Cloudflare proxies
+  only HTTP/HTTPS, so gating a non-proxied port to CF IPs would just block
+  everyone.
+- **This is not a WAF.** It doesn't inspect payloads or block attack patterns.
+  It guarantees traffic *reaches* your origin only via Cloudflare, so
+  Cloudflare's WAF, rules, and rate-limits can't be sidestepped — it's the
+  enforcement half of "Cloudflare in front"; the intelligence stays in
+  Cloudflare.
+- **mTLS still needs the zone-level toggle** (SSL/TLS → Origin Server →
+  Authenticated Origin Pulls), exactly as for OwnTracks.
+- **SSH and every non-managed port are never touched** — that guarantee holds
+  no matter which app you point this at.
+
+In short: if "only Cloudflare should be able to reach this origin" is true for
+a service, this tool enforces it. OwnTracks just happens to be the first
+service it was pointed at.
+
 ## Get the code
 
 First install — clone the repo onto the Debian 12 box:
