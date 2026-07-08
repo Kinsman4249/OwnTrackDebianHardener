@@ -1,6 +1,6 @@
 # OwnTrackDebianHardener
 
-**Version 2.1.0**
+**Version 2.2.0**
 
 A Debian 12 daemon that locks down an [OwnTracks](https://owntracks.org/)
 deployment so only Cloudflare can reach it — with a **test-first workflow**:
@@ -195,11 +195,49 @@ each line PASS/WARN/FAIL. Re-run it anytime:
 sudo ./install.sh --diagnostics
 ```
 
+### Already have an nginx vhost for this host? Use `--attach-vhost`
+
+If your box already serves the OwnTracks hostname through its own vhost —
+basic-auth, PHP frontend, custom `location` blocks, the works — **don't let
+the installer generate a competing one**. Two vhosts claiming the same
+`server_name` make nginx silently ignore one of them ("conflicting server
+name"), and whichever loses serves nothing.
+
+Attach mode layers the protection into *your* vhost instead:
+
+```sh
+sudo bash install.sh --attach-vhost /etc/nginx/sites-enabled/owntracks --yes
+```
+
+What it does:
+
+- Injects exactly three `include` lines (realip, mTLS, enforce) into each
+  `server` block of your file, wrapped in marker comments — **idempotent**
+  (re-runs detect the markers and do nothing) and **reversible**
+  (`--uninstall` removes exactly that stanza; a one-time backup lands at
+  `<file>.pre-cfo`).
+- Removes any previously-generated standalone vhost so nothing competes.
+- Persists the path in config (`CFO_ATTACH_VHOST`) — every future installer
+  run reuses it automatically.
+- Managed-port discovery reads *your* vhost's `listen` directives.
+- Validates with `nginx -t` after injecting; restores your file on failure.
+
+Your auth, routing, cookies, and locations are untouched — you just gain the
+decision log, real-IP handling, mTLS verification, and (in deploy mode) the
+Cloudflare-only 403 gate, inside the vhost that actually serves traffic.
+
+The installer also **refuses to create its own vhost** when it detects
+another enabled vhost claiming the server name, and points you at the exact
+`--attach-vhost` command (override with `--force-own-vhost` if you really
+mean it).
+
 ### Flags
 
 | Flag | Default | Meaning |
 |------|---------|---------|
 | `--deploy` | test mode | Enforce. Without it you're observing only |
+| `--attach-vhost <file>` | off | Layer includes into an existing vhost instead of generating one (persisted; see above) |
+| `--force-own-vhost` | off | Generate our vhost despite a detected server-name conflict (not recommended) |
 | `--server-name <host>` | auto-detect | Public FQDN (auto: OwnTracks config → nginx `server_name` → reverse-DNS PTR) |
 | `--cert <path> --key <path>` | prompt/config | TLS material (or use `--cf-auto-cert`) |
 | `--cf-auto-cert` | off | Provision a 15-year Origin CA cert via the Cloudflare API |

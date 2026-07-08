@@ -77,7 +77,7 @@
 # shellcheck disable=SC2034
 
 # ---- Version -------------------------------------------------------------------
-CFO_VERSION="2.1.0"
+CFO_VERSION="2.2.0"
 
 # ---- Paths -------------------------------------------------------------------
 # The ${VAR:-default} pattern lets tests (or unusual installs) override any of
@@ -540,6 +540,7 @@ load_config() {
     : "${CFO_CF_ASNS:=13335}"
     : "${CFO_EXTRA_PORTS:=}"
     : "${CFO_TEST_LOG_MAX_MB:=15}"
+    : "${CFO_ATTACH_VHOST:=}"
     case "$CFO_MODE" in
         test|deploy) : ;;
         *) die "invalid CFO_MODE in config: $CFO_MODE" ;;
@@ -568,19 +569,21 @@ _listen_to_port() {
     # we don't emit those; our managed vhosts always specify a port.
 }
 
-# parse_managed_ports_from_dump <nginx-T-dump-file>
+# parse_managed_ports_from_dump <nginx-T-dump-file> [attached-vhost-path]
 # Reads an `nginx -T` dump and emits the listen ports found in the config files
-# this tool manages (owntracks vhost + optional global redirect), sorted unique.
+# this tool manages (owntracks vhost + optional global redirect + the operator
+# vhost named by --attach-vhost, when set), sorted unique.
 # `nginx -T` marks each file's content with a "# configuration file <path>:"
 # header line — the loop below tracks whether we are inside one of OUR files.
 parse_managed_ports_from_dump() {
-    local dump="$1"
+    local dump="$1" attach="${2:-}"
     local in_managed=0 line port
     while IFS= read -r line; do
         case "$line" in
             "# configuration file "*)
                 if [[ "$line" == *"/owntracks.conf"* ]] || \
-                   [[ "$line" == *"/00-cf-global-redirect.conf"* ]]; then
+                   [[ "$line" == *"/00-cf-global-redirect.conf"* ]] || \
+                   { [[ -n "$attach" ]] && [[ "$line" == "# configuration file ${attach}:" ]]; }; then
                     in_managed=1
                 else
                     in_managed=0
@@ -599,12 +602,13 @@ parse_managed_ports_from_dump() {
 }
 
 # discover_managed_ports → space-separated port list on stdout.
+# Includes the attached vhost's ports when CFO_ATTACH_VHOST is configured.
 # Falls back to cached ports, then to "80 443", warning on fallback.
 discover_managed_ports() {
     local dump ports
     dump="$(mktemp)"
     if nginx -T > "$dump" 2>/dev/null; then
-        ports="$(parse_managed_ports_from_dump "$dump" | tr '\n' ' ')"
+        ports="$(parse_managed_ports_from_dump "$dump" "${CFO_ATTACH_VHOST:-}" | tr '\n' ' ')"
         ports="${ports% }"          # trim the trailing space tr left behind
         rm -f "$dump"
         if [[ -n "$ports" ]]; then
@@ -726,6 +730,85 @@ reverse_dns() {
     fi
     [[ -n "$name" ]] || return 1
     printf '%s\n' "$name"
+}
+
+# ---- Attach mode: layer includes into an operator-owned vhost ----------------------
+# When a box already has a rich, hand-crafted vhost for the OwnTracks host
+# (auth, PHP frontend, custom locations), generating our own vhost creates a
+# "conflicting server name" — nginx ignores one of them (found in production
+# 2026-07-08). Attach mode is the answer: inject our three include lines into
+# THEIR vhost instead, delimited by marker comments so the operation is
+# idempotent and cleanly reversible.
+
+CFO_ATTACH_MARKER_BEGIN="# >>> cf-owntracks includes (managed) >>>"
+CFO_ATTACH_MARKER_END="# <<< cf-owntracks includes <<<"
+
+# attach_vhost_includes <vhost-file>
+# Inserts the include lines after the FIRST server_name directive of each
+# server block (one injection per block — a duplicate real_ip_header would
+# fail nginx -t). Validates with nginx -t afterwards; on failure the original
+# file is restored and we die. A one-time backup is left at <file>.pre-cfo.
+attach_vhost_includes() {
+    local vf="$1"
+    [[ -f "$vf" ]] || die "attach-vhost: file not found: $vf"
+    grep -qE '^[[:space:]]*server[[:space:]{]' "$vf" || die "attach-vhost: no server block found in $vf"
+
+    # Idempotency: if our marker is already there, there is nothing to do.
+    if grep -qF "$CFO_ATTACH_MARKER_BEGIN" "$vf"; then
+        log_info "attach-vhost: includes already present in $vf"
+        return 0
+    fi
+
+    # Keep a restorable copy right next to the file (never overwritten once
+    # created — it always holds the pre-cf-owntracks original).
+    [[ -f "${vf}.pre-cfo" ]] || cp -p "$vf" "${vf}.pre-cfo"
+
+    local tmp
+    tmp="$(mktemp)"
+    # awk walks the file: entering a server block resets the "done" flag; the
+    # first server_name line of each block gets the include stanza appended.
+    # (mawk-compatible: plain patterns and print only.)
+    awk -v mb="$CFO_ATTACH_MARKER_BEGIN" -v me="$CFO_ATTACH_MARKER_END" '
+        /^[ \t]*server[ \t{]/ { done = 0 }
+        { print }
+        /^[ \t]*server_name[ \t]/ && done == 0 {
+            print "        " mb
+            print "        include /etc/nginx/snippets/cloudflare-realip.conf;"
+            print "        include /etc/nginx/snippets/cloudflare-mtls.conf;"
+            print "        include /etc/nginx/snippets/cloudflare-enforce.conf;"
+            print "        " me
+            done = 1
+        }
+    ' "$vf" > "$tmp"
+
+    # `cat >` (not mv) writes THROUGH a sites-enabled symlink to its target
+    # and preserves the file's owner/mode.
+    cat "$tmp" > "$vf"
+    rm -f "$tmp"
+
+    if ! nginx -t 2>&1; then
+        log_error "attach-vhost: nginx -t failed after injection — restoring $vf"
+        cat "${vf}.pre-cfo" > "$vf"
+        nginx -t >/dev/null 2>&1 || log_error "nginx config broken even after restore — manual attention required"
+        die "attach-vhost: injection made nginx config invalid; original restored"
+    fi
+    log_info "attach-vhost: includes injected into $vf (backup: ${vf}.pre-cfo)"
+}
+
+# detach_vhost_includes <vhost-file>
+# Removes everything between (and including) our marker lines. Safe to call
+# when the file or the markers don't exist.
+detach_vhost_includes() {
+    local vf="$1"
+    [[ -f "$vf" ]] || return 0
+    grep -qF "$CFO_ATTACH_MARKER_BEGIN" "$vf" || return 0
+    local tmp
+    tmp="$(mktemp)"
+    # sed range delete: from the begin marker line to the end marker line.
+    sed '/>>> cf-owntracks includes (managed) >>>/,/<<< cf-owntracks includes <<</d' "$vf" > "$tmp"
+    cat "$tmp" > "$vf"
+    rm -f "$tmp"
+    log_info "attach-vhost: includes removed from $vf"
 }
 
 # ---- SSH port detection ----------------------------------------------------------

@@ -3,7 +3,7 @@
 # `systemctl start cf-owntracks.service` to apply changes.
 
 # Version marker written by the installer (informational).
-CFO_VERSION="2.0.0"
+CFO_VERSION="2.2.0"
 
 # Operating mode:
 #   test    — DEFAULT. Everything runs live but NOTHING enforces. Would-block
@@ -44,6 +44,11 @@ CFO_EXTRA_PORTS=""
 
 # Decision log size cap in MB (test mode). Rotated to .1 when exceeded.
 CFO_TEST_LOG_MAX_MB=15
+
+# Attach mode: path of an operator-owned vhost that carries the cf-owntracks
+# include lines instead of a generated standalone vhost. Empty = the installer
+# generates and manages its own vhost. Set via install.sh --attach-vhost.
+CFO_ATTACH_VHOST=""
 
 # Operator allowlist lives in /etc/cf-owntracks/allowlist (one IP/CIDR per
 # line, # comments allowed). Those sources are ALWAYS allowed on the managed

@@ -40,7 +40,7 @@ source "${SCRIPT_DIR}/lib/common.sh"
 
 usage() {
     cat <<'EOF'
-cf-owntracks installer (v2.1.0)
+cf-owntracks installer (v2.2.0)
 
 USAGE
     sudo ./install.sh [options]
@@ -60,6 +60,20 @@ CORE SETTINGS (prompted interactively when omitted; existing config = defaults)
     --cert <path>             TLS certificate (fullchain)
     --key <path>              TLS private key
     --owntracks-port <port>   Local recorder port (default: 8083)
+
+EXISTING VHOST (recommended when this host already has its own nginx config)
+    --attach-vhost <file>     Layer protection into an EXISTING vhost instead
+                              of generating a standalone one: injects the
+                              three cf-owntracks include lines into each
+                              server block of <file> (marker-delimited,
+                              idempotent, reverted on --uninstall). Your auth,
+                              locations, and routing stay untouched. The path
+                              persists in config — future runs reuse it and
+                              never create a competing vhost.
+    --force-own-vhost         Generate our own vhost even though another vhost
+                              already claims the server name (NOT recommended:
+                              nginx ignores duplicate server names, which
+                              silently disables one of the two)
 
 AUTOMATIC ORIGIN CERTIFICATE (Cloudflare Origin CA)
     --cf-auto-cert            Provision a 15-year origin certificate for the
@@ -109,6 +123,7 @@ ARG_INTERVAL=""; ARG_LOG_MAX=""; ARG_FORCE=""
 declare -a ARG_ALLOW=() ARG_MANAGE_PORTS=()       # repeatable flags -> arrays
 ASSUME_YES=0; DRY_RUN=0; DO_UNINSTALL=0; DO_DIAGNOSTICS=0
 AUTO_CERT=0
+ARG_ATTACH_VHOST=""; FORCE_OWN_VHOST=0
 # Environment credentials are honored as-is; flags below can override them.
 CF_ORIGIN_CA_KEY="${CF_ORIGIN_CA_KEY:-}"
 CF_API_TOKEN="${CF_API_TOKEN:-}"
@@ -124,6 +139,8 @@ while (( $# )); do
         --cf-origin-ca-key)     CF_ORIGIN_CA_KEY="$2"; AUTO_CERT=1; shift 2 ;;
         --cf-api-token)         CF_API_TOKEN="$2"; AUTO_CERT=1; shift 2 ;;
         --owntracks-port)       ARG_PORT="$2"; shift 2 ;;
+        --attach-vhost)         ARG_ATTACH_VHOST="$2"; shift 2 ;;
+        --force-own-vhost)      FORCE_OWN_VHOST=1; shift ;;
         --deploy)               ARG_MODE="deploy"; shift ;;
         --test)                 ARG_MODE="test"; shift ;;
         --allow)                ARG_ALLOW+=("$2"); shift 2 ;;
@@ -228,6 +245,12 @@ do_uninstall() {
     fi
     rm -f /etc/nftables.d/cf-owntracks.conf 2>/dev/null || true
 
+    # Attach mode: pull our include lines back out of the operator's vhost
+    # (their file, their app — only our marker-delimited stanza goes).
+    if [[ -n "${CFO_ATTACH_VHOST:-}" ]]; then
+        detach_vhost_includes "$CFO_ATTACH_VHOST"
+    fi
+
     # Remove every nginx piece we own, then reload if the config still parses.
     rm -f "$CFO_NGINX_VHOST" "$CFO_NGINX_VHOST_ENABLED" \
           "$CFO_NGINX_GLOBAL_REDIRECT" "$CFO_NGINX_GLOBAL_REDIRECT_ENABLED" \
@@ -279,6 +302,7 @@ ASN_FAILSAFE="${ARG_ASN_FAILSAFE:-${CFO_ASN_FAILSAFE:-1}}"
 CF_ASNS="${ARG_ASNS:-${CFO_CF_ASNS:-13335}}"
 TEST_LOG_MAX_MB="${ARG_LOG_MAX:-${CFO_TEST_LOG_MAX_MB:-15}}"
 REFRESH_INTERVAL="${ARG_INTERVAL:-6h}"
+ATTACH_VHOST="${ARG_ATTACH_VHOST:-${CFO_ATTACH_VHOST:-}}"
 EXTRA_PORTS="${CFO_EXTRA_PORTS:-}"
 if (( ${#ARG_MANAGE_PORTS[@]} > 0 )); then
     # Merge config extras with --manage-port flags: numbers only, dedupe,
@@ -506,7 +530,17 @@ run_diagnostics() {
         d_fail "nginx -t: $(printf '%s' "$ngx_out" | tail -2 | tr '\n' ' ')"
     fi
     if grep -q 'conflicting server name' <<<"$ngx_out"; then
-        d_fail "nginx: CONFLICTING SERVER NAME — another vhost claims the same host:port, so the cf-owntracks vhost is IGNORED (no decision log, no enforcement at nginx level). Find it: grep -RIl '${CFO_SERVER_NAME:-<your-server-name>}' /etc/nginx/sites-enabled/ — then disable or merge the duplicate."
+        d_fail "nginx: CONFLICTING SERVER NAME — another vhost claims the same host:port, so the cf-owntracks vhost is IGNORED (no decision log, no enforcement at nginx level). Find it: grep -RIl '${CFO_SERVER_NAME:-<your-server-name>}' /etc/nginx/sites-enabled/ — then rerun the installer with --attach-vhost <that-file>."
+    fi
+
+    # Attach mode: our protection lives inside the operator's vhost — verify
+    # the marker-delimited includes are actually present.
+    if [[ -n "${CFO_ATTACH_VHOST:-}" ]]; then
+        if grep -qF 'cf-owntracks includes (managed)' "$CFO_ATTACH_VHOST" 2>/dev/null; then
+            d_pass "attach mode: includes present in ${CFO_ATTACH_VHOST}"
+        else
+            d_fail "attach mode: includes MISSING from ${CFO_ATTACH_VHOST} — rerun the installer"
+        fi
     fi
 
     # 4. Ports: managed / ssh / other — and the SSH-exclusion proof.
@@ -810,6 +844,29 @@ if ! check_ssh_reachable "$BACKEND"; then
     log_warn "cf-owntracks never touches SSH ports, but verify your own firewall policy."
 fi
 
+# Attach mode validation + the conflicting-vhost guard.
+if [[ -n "$ATTACH_VHOST" ]]; then
+    [[ -f "$ATTACH_VHOST" ]] || die "--attach-vhost: file not found: $ATTACH_VHOST"
+    grep -qE '^[[:space:]]*server[[:space:]{]' "$ATTACH_VHOST" \
+        || die "--attach-vhost: no server block found in $ATTACH_VHOST"
+    log_info "attach mode: protection will be layered into ${ATTACH_VHOST}"
+else
+    # Not attaching — creating our own vhost. If ANOTHER enabled vhost already
+    # claims this server name, nginx will ignore one of the two ("conflicting
+    # server name") and the loser silently serves nothing. This exact
+    # foot-gun shipped once; now it is a hard stop.
+    CONFLICT_FILE="$(grep -RIl -E "server_name[^;]*[[:space:]]${SERVER_NAME//./\\.}" \
+        /etc/nginx/sites-enabled/ 2>/dev/null | grep -v '/owntracks.conf$' | head -1 || true)"
+    if [[ -n "$CONFLICT_FILE" ]] && (( FORCE_OWN_VHOST == 0 )); then
+        log_error "another enabled vhost already serves ${SERVER_NAME}: ${CONFLICT_FILE}"
+        log_error "creating our own vhost would conflict (nginx ignores duplicate server names)."
+        log_error "either:"
+        log_error "  RECOMMENDED: rerun with  --attach-vhost ${CONFLICT_FILE}"
+        log_error "  or disable that vhost first, or pass --force-own-vhost to override"
+        die "aborting to avoid a conflicting server name"
+    fi
+fi
+
 # nginx allows only ONE default_server per listen port — refuse to fight an
 # existing one rather than break the reload later.
 if [[ "$GLOBAL_REDIRECT" == "1" ]]; then
@@ -859,6 +916,7 @@ CFO_ASN_FAILSAFE=${ASN_FAILSAFE}
 CFO_CF_ASNS="${CF_ASNS}"
 CFO_EXTRA_PORTS="${EXTRA_PORTS}"
 CFO_TEST_LOG_MAX_MB=${TEST_LOG_MAX_MB}
+CFO_ATTACH_VHOST="${ATTACH_VHOST}"
 EOF
 }
 
@@ -963,11 +1021,20 @@ EOF
     # v1 leftover cleanup: the old allow snippet is no longer referenced.
     rm -f "$CFO_NGINX_LEGACY_ALLOW_SNIPPET"
 
-    log_info "rendering OwnTracks vhost"
-    render_vhost > "$CFO_NGINX_VHOST"
-    chmod 0644 "$CFO_NGINX_VHOST"
-    # sites-enabled entries are symlinks into sites-available (Debian custom).
-    ln -sf "$CFO_NGINX_VHOST" "$CFO_NGINX_VHOST_ENABLED"
+    if [[ -n "$ATTACH_VHOST" ]]; then
+        # Attach mode: the operator's vhost is the app; we only add our three
+        # include lines to it. Any previously-generated standalone vhost is
+        # removed so it can never shadow (or be shadowed by) the real one.
+        log_info "attach mode: standing down any generated vhost"
+        rm -f "$CFO_NGINX_VHOST" "$CFO_NGINX_VHOST_ENABLED"
+        attach_vhost_includes "$ATTACH_VHOST"
+    else
+        log_info "rendering OwnTracks vhost"
+        render_vhost > "$CFO_NGINX_VHOST"
+        chmod 0644 "$CFO_NGINX_VHOST"
+        # sites-enabled entries are symlinks into sites-available (Debian custom).
+        ln -sf "$CFO_NGINX_VHOST" "$CFO_NGINX_VHOST_ENABLED"
+    fi
 
     if [[ "$GLOBAL_REDIRECT" == "1" ]]; then
         log_info "installing global :80 -> :443 redirect"
@@ -1035,6 +1102,9 @@ fi
 echo "  ----------------------------------------------------------------------------"
 echo "  server:       https://${SERVER_NAME} (recorder on 127.0.0.1:${OWNTRACKS_PORT})"
 echo "  backend:      ${BACKEND}    mTLS: ${MTLS_ENABLED}    ASN failsafe: ${ASN_FAILSAFE}"
+if [[ -n "$ATTACH_VHOST" ]]; then
+    echo "  vhost:        ATTACHED to ${ATTACH_VHOST} (your config; our includes are marker-delimited)"
+fi
 echo "  refresh:      every ${REFRESH_INTERVAL} + auto-retry ~30min after failures"
 echo "  allowlist:    ${CFO_ALLOWLIST_FILE} (edit + wait for refresh, or: systemctl start cf-owntracks.service)"
 echo "  config:       ${CFO_CONFIG_FILE} (settings are reused by future installer runs)"
