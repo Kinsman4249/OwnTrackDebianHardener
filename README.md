@@ -57,27 +57,36 @@ First install — clone the repo onto the Debian 12 box:
 sudo apt-get install -y git          # if git isn't there yet
 git clone https://github.com/Kinsman4249/OwnTrackDebianHardener.git
 cd OwnTrackDebianHardener
+# Files are stored non-executable in the repo. Tell git to ignore
+# executable-bit differences so the chmod below never turns into a
+# "local changes would be overwritten" conflict on a future `git pull`.
+git config core.fileMode false
 chmod +x install.sh uninstall.sh smoke-test.sh bin/cf-owntracks-refresh
 ```
+
+> **Tip:** you can skip both the `core.fileMode` and `chmod` lines entirely by
+> invoking the scripts with `bash` — e.g. `sudo bash install.sh` — which
+> doesn't care about the executable bit.
 
 Updating an existing clone to the latest version:
 
 ```sh
 cd OwnTrackDebianHardener
-git pull
-chmod +x install.sh uninstall.sh smoke-test.sh bin/cf-owntracks-refresh
-sudo ./install.sh        # re-run; your settings are the defaults
+git config core.fileMode false   # once per clone; harmless to repeat
+git pull                         # no conflict even though you chmod'd earlier
+sudo bash install.sh             # re-run; your settings are the defaults
 ```
 
 To pin a specific release instead of `main`: `git checkout v2.1.0`
 (or `git pull --tags && git checkout v2.1.0` on an existing clone).
 
-No git? Grab a release tarball:
+No git? Grab a release tarball (tarballs preserve the executable bit, so no
+chmod dance needed):
 
 ```sh
 curl -L https://github.com/Kinsman4249/OwnTrackDebianHardener/archive/refs/tags/v2.1.0.tar.gz | tar xz
 cd OwnTrackDebianHardener-2.1.0
-chmod +x install.sh uninstall.sh smoke-test.sh bin/cf-owntracks-refresh
+sudo bash install.sh
 ```
 
 ## Install
@@ -355,9 +364,9 @@ sudo ./smoke-test.sh                                        # on origin
 
 ```sh
 cd OwnTrackDebianHardener
+git config core.fileMode false   # once per clone; ignores chmod exec-bit deltas
 git pull
-chmod +x install.sh uninstall.sh smoke-test.sh bin/cf-owntracks-refresh
-sudo ./install.sh
+sudo bash install.sh
 ```
 
 The installer reads your 1.x config as prompt defaults (nothing is
@@ -391,6 +400,14 @@ renewal traffic), or temporarily add LE to the allowlist.
 **Locked out of SSH** — not by this tool: SSH ports are hard-excluded and
 the smoke test proves it. Check your provider's edge firewall or your own
 `ufw`/`nft` policy.
+
+**`git pull` says "Your local changes … would be overwritten by merge"**
+(listing `install.sh`, `uninstall.sh`, etc.) — you ran `chmod +x` during
+setup, and git treats the executable-bit flip as a local modification.
+Run `git config core.fileMode false` once in the clone, then `git pull`
+again. It's harmless — it only tells git to stop comparing executable bits.
+Watch for this one: if the pull aborts, the fix you were pulling never
+installed, so a re-run of the installer will reproduce the *old* failure.
 
 **ufw is slow / rule list is huge** — the ASN failsafe multiplies ufw's
 per-CIDR rules. `--force nftables` (interval sets) handles the full merged
