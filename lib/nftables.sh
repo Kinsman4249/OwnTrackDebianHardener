@@ -30,6 +30,12 @@ CFO_NFT_TABLE="inet cf_owntracks"
 # Emit a named set definition when the source file has entries; nothing
 # otherwise (nft errors on a set with an empty elements list, so we simply
 # skip the set — and the rule that would use it — when the list is empty).
+#
+# auto-merge is essential: BGP-announced prefix lists (the ASN failsafe)
+# routinely contain aggregate + more-specific overlaps (e.g. a /32 and a /48
+# inside it). Interval sets REJECT overlapping elements unless auto-merge
+# tells nft to merge them — without it, `nft -c` fails validation the moment
+# real ASN data lands (found in production on 2026-07-08).
 # _nft_emit_set <name> <type> <cidr-file>
 _nft_emit_set() {
     local name="$1" type="$2" file="$3"
@@ -42,6 +48,7 @@ _nft_emit_set() {
     set ${name} {
         type ${type}
         flags interval
+        auto-merge
         elements = { ${elements} }
     }
 EOF
