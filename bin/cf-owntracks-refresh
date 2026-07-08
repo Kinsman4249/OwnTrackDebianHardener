@@ -1,10 +1,21 @@
 #!/usr/bin/env bash
-# cf-owntracks-refresh
-# Fetches Cloudflare IP ranges (and AOP CA cert if mTLS enabled), validates,
-# and atomically updates the firewall + nginx snippets.
+# cf-owntracks-refresh (v2)
 #
-# Runs daily via systemd timer; flock-protected against overlap.
-# Exits non-zero on any failure (refusing to apply suspicious data).
+# Keeps the firewall and nginx in sync with:
+#   - Cloudflare's published IPv4/IPv6 ranges (primary, run fails if unavailable)
+#   - Cloudflare's ASN-announced prefixes (failsafe, degrades to cache on failure)
+#   - the operator allowlist (/etc/cf-owntracks/allowlist)
+#   - the managed port set discovered from nginx's own listen directives
+#   - the Cloudflare origin-pull CA (when mTLS is enabled)
+#
+# Renders according to CFO_MODE:
+#   test    — nothing enforces; would-blocked traffic is logged (firewall
+#             kernel log + NDJSON decision log via nginx)
+#   deploy  — firewall drops, nginx returns 403 for anything that isn't
+#             Cloudflare, localhost, or whitelisted
+#
+# Runs via systemd timer (6-hourly by default); flock-protected; every apply
+# is transactional with full rollback (nginx snippets, CA, firewall).
 
 set -Eeuo pipefail
 
@@ -14,7 +25,6 @@ source "${CFO_LIB_DIR}/common.sh"
 
 require_root
 
-# Take an exclusive lock; bail if another run is in progress.
 exec 9>"${CFO_LOCK_FILE}"
 if ! flock -n 9; then
     log_error "another refresh is in progress; exiting"
@@ -30,189 +40,344 @@ case "${CFO_FW_BACKEND}" in
     *) die "unknown firewall backend: ${CFO_FW_BACKEND}" ;;
 esac
 
-# ---- Workspace ---------------------------------------------------------------
 WORK_DIR="$(mktemp -d -t cf-owntracks.XXXXXX)"
 cleanup() { rm -rf "$WORK_DIR"; }
 trap cleanup EXIT
 
-V4_NEW="${WORK_DIR}/ips-v4.new"
-V6_NEW="${WORK_DIR}/ips-v6.new"
-V4_VALID="${WORK_DIR}/ips-v4.valid"
-V6_VALID="${WORK_DIR}/ips-v6.valid"
-NFT_NEW="${WORK_DIR}/ruleset.nft"
-IPT_V4_NEW="${WORK_DIR}/ruleset.v4"
-IPT_V6_NEW="${WORK_DIR}/ruleset.v6"
+# ---- 1. Port + SSH discovery --------------------------------------------------
+SSH_PORTS="$(detect_ssh_ports | tr '\n' ' ')"; SSH_PORTS="${SSH_PORTS% }"
+VHOST_PORTS="$(discover_managed_ports)"
+MANAGED_PORTS="$(build_managed_ports "$VHOST_PORTS" "$CFO_EXTRA_PORTS" "$SSH_PORTS")"
+[[ -n "$MANAGED_PORTS" ]] || die "managed port set is empty after SSH exclusion — nothing to protect"
 
-REALIP_NEW="${WORK_DIR}/cloudflare-realip.conf"
-ALLOW_NEW="${WORK_DIR}/cloudflare-allow.conf"
-MTLS_NEW="${WORK_DIR}/cloudflare-mtls.conf"
-AOP_CA_NEW="${WORK_DIR}/origin-pull-ca.pem"
+PORTS_CSV="${MANAGED_PORTS// /,}"
+SSH_CSV="${SSH_PORTS// /,}"
+log_info "managed ports: ${MANAGED_PORTS} (ssh excluded: ${SSH_PORTS}) mode=${CFO_MODE}"
 
-# Backups of the files we'll replace (for rollback).
-REALIP_BAK="${WORK_DIR}/cloudflare-realip.bak"
-ALLOW_BAK="${WORK_DIR}/cloudflare-allow.bak"
-MTLS_BAK="${WORK_DIR}/cloudflare-mtls.bak"
-FW_BAK="${WORK_DIR}/firewall.bak"
+# ---- 2. Fetch + validate published Cloudflare lists ---------------------------
+V4_NEW="${WORK_DIR}/ips-v4.new";  V6_NEW="${WORK_DIR}/ips-v6.new"
+V4_VALID="${WORK_DIR}/ips-v4.valid"; V6_VALID="${WORK_DIR}/ips-v6.valid"
 
-# ---- 1. Fetch Cloudflare IP lists -------------------------------------------
-log_info "fetching Cloudflare IP ranges"
+log_info "fetching Cloudflare published IP ranges"
 fetch_with_retry "$CFO_IPS_V4_URL" "$V4_NEW" || die "failed to fetch IPv4 list"
 fetch_with_retry "$CFO_IPS_V6_URL" "$V6_NEW" || die "failed to fetch IPv6 list"
 
-# ---- 2. Validate CIDR format ------------------------------------------------
 validate_cidr_list v4 < "$V4_NEW" > "$V4_VALID" || die "IPv4 validation failed"
 validate_cidr_list v6 < "$V6_NEW" > "$V6_VALID" || die "IPv6 validation failed"
 
 v4_count=$(grep -c . "$V4_VALID" || true)
 v6_count=$(grep -c . "$V6_VALID" || true)
-log_info "fetched ${v4_count} IPv4 + ${v6_count} IPv6 ranges"
-
-if (( v4_count < CFO_MIN_V4_RANGES )); then
-    die "IPv4 count ${v4_count} below threshold ${CFO_MIN_V4_RANGES}"
-fi
-if (( v6_count < CFO_MIN_V6_RANGES )); then
-    die "IPv6 count ${v6_count} below threshold ${CFO_MIN_V6_RANGES}"
-fi
-
-# ---- 3. Sanity-check delta vs last-known-good -------------------------------
+(( v4_count >= CFO_MIN_V4_RANGES )) || die "IPv4 count ${v4_count} below threshold ${CFO_MIN_V4_RANGES}"
+(( v6_count >= CFO_MIN_V6_RANGES )) || die "IPv6 count ${v6_count} below threshold ${CFO_MIN_V6_RANGES}"
 check_delta "$V4_VALID" "$CFO_IPS_V4_FILE" v4 || die "IPv4 delta exceeded threshold"
 check_delta "$V6_VALID" "$CFO_IPS_V6_FILE" v6 || die "IPv6 delta exceeded threshold"
+log_info "published ranges: ${v4_count} IPv4 + ${v6_count} IPv6"
 
-# ---- 4. (mTLS) Fetch + validate Cloudflare origin-pull CA -------------------
-AOP_NEEDS_UPDATE=0
+# ---- 3. ASN failsafe (never fails the run) ------------------------------------
+ASN4_FINAL="${WORK_DIR}/asn-v4.final"; ASN6_FINAL="${WORK_DIR}/asn-v6.final"
+: > "$ASN4_FINAL"; : > "$ASN6_FINAL"
+asn4_count=0; asn6_count=0
+
+if [[ "${CFO_ASN_FAILSAFE}" == "1" ]]; then
+    ASN4_RAW="${WORK_DIR}/asn-v4.raw"; ASN6_RAW="${WORK_DIR}/asn-v6.raw"
+    # shellcheck disable=SC2086
+    if fetch_asn_prefixes "$ASN4_RAW" "$ASN6_RAW" $CFO_CF_ASNS; then
+        # Lenient validation: keep valid lines, count rejects (3rd-party data).
+        ASN4_OK="${WORK_DIR}/asn-v4.ok"; ASN6_OK="${WORK_DIR}/asn-v6.ok"
+        : > "$ASN4_OK"; : > "$ASN6_OK"
+        rej=0
+        while IFS= read -r c; do
+            [[ -z "$c" ]] && continue
+            if is_valid_cidr_v4 "$c"; then echo "$c" >> "$ASN4_OK"; else rej=$((rej+1)); fi
+        done < "$ASN4_RAW"
+        while IFS= read -r c; do
+            [[ -z "$c" ]] && continue
+            if is_valid_cidr_v6 "$c"; then echo "$c" >> "$ASN6_OK"; else rej=$((rej+1)); fi
+        done < "$ASN6_RAW"
+        (( rej > 0 )) && log_warn "ASN failsafe: rejected ${rej} malformed prefixes"
+
+        # Keep only prefixes NOT already covered by the published lists.
+        filter_novel_prefixes "$ASN4_OK" "$V4_VALID" > "$ASN4_FINAL" || true
+        filter_novel_prefixes "$ASN6_OK" "$V6_VALID" > "$ASN6_FINAL" || true
+        asn4_count=$(grep -c . "$ASN4_FINAL" || true)
+        asn6_count=$(grep -c . "$ASN6_FINAL" || true)
+
+        if (( asn4_count + asn6_count > CFO_MAX_ASN_NOVEL )); then
+            log_error "ASN failsafe: novel set too large (${asn4_count}+${asn6_count} > ${CFO_MAX_ASN_NOVEL}) — using cached set"
+            if [[ -f "$CFO_ASN_V4_FILE" ]]; then cp "$CFO_ASN_V4_FILE" "$ASN4_FINAL"; else : > "$ASN4_FINAL"; fi
+            if [[ -f "$CFO_ASN_V6_FILE" ]]; then cp "$CFO_ASN_V6_FILE" "$ASN6_FINAL"; else : > "$ASN6_FINAL"; fi
+            asn4_count=$(grep -c . "$ASN4_FINAL" || true)
+            asn6_count=$(grep -c . "$ASN6_FINAL" || true)
+        fi
+        log_info "ASN failsafe: ${asn4_count} novel IPv4 + ${asn6_count} novel IPv6 prefixes (AS: ${CFO_CF_ASNS})"
+    else
+        log_warn "ASN failsafe: all sources unreachable — using cached set"
+        [[ -f "$CFO_ASN_V4_FILE" ]] && cp "$CFO_ASN_V4_FILE" "$ASN4_FINAL"
+        [[ -f "$CFO_ASN_V6_FILE" ]] && cp "$CFO_ASN_V6_FILE" "$ASN6_FINAL"
+        asn4_count=$(grep -c . "$ASN4_FINAL" || true)
+        asn6_count=$(grep -c . "$ASN6_FINAL" || true)
+    fi
+else
+    log_info "ASN failsafe disabled (CFO_ASN_FAILSAFE=0)"
+fi
+
+# ---- 4. Operator allowlist -----------------------------------------------------
+ALLOW4="${WORK_DIR}/allow-v4"; ALLOW6="${WORK_DIR}/allow-v6"
+read_allowlist v4 > "$ALLOW4"
+read_allowlist v6 > "$ALLOW6"
+allow_count=$(( $(grep -c . "$ALLOW4" || true) + $(grep -c . "$ALLOW6" || true) ))
+(( allow_count > 0 )) && log_info "allowlist: ${allow_count} entries"
+
+# ---- 5. mTLS CA ---------------------------------------------------------------
+AOP_CA_NEW="${WORK_DIR}/origin-pull-ca.pem"
+AOP_CA_STAGED=0   # 1 = new CA content should be installed
+MTLS_ACTIVE=0     # 1 = render verify directives
+
 if [[ "${CFO_MTLS_ENABLED}" == "1" ]]; then
     if fetch_with_retry "$CFO_AOP_CA_URL" "$AOP_CA_NEW"; then
-        if ! openssl x509 -in "$AOP_CA_NEW" -noout 2>/dev/null; then
-            die "fetched origin-pull CA is not a valid x509 certificate"
-        fi
-        local_hash=""
-        new_hash="$(sha256sum "$AOP_CA_NEW" | awk '{print $1}')"
-        if [[ -f "$CFO_AOP_CA_HASH" ]]; then
-            local_hash="$(cat "$CFO_AOP_CA_HASH" 2>/dev/null || true)"
-        fi
-        if [[ "$new_hash" != "$local_hash" ]]; then
-            log_info "origin-pull CA changed (was: ${local_hash:0:12}…  now: ${new_hash:0:12}…)"
-            AOP_NEEDS_UPDATE=1
+        if openssl x509 -in "$AOP_CA_NEW" -noout 2>/dev/null; then
+            new_hash="$(sha256sum "$AOP_CA_NEW" | awk '{print $1}')"
+            old_hash=""
+            [[ -f "$CFO_AOP_CA_HASH" ]] && old_hash="$(cat "$CFO_AOP_CA_HASH" 2>/dev/null || true)"
+            if [[ "$new_hash" != "$old_hash" ]] || [[ ! -s "$CFO_AOP_CA_FILE" ]]; then
+                log_info "origin-pull CA new or changed (now: ${new_hash:0:12}…)"
+                AOP_CA_STAGED=1
+            fi
+            MTLS_ACTIVE=1
+        else
+            log_warn "fetched origin-pull CA is not valid x509 — ignoring fetch"
+            [[ -s "$CFO_AOP_CA_FILE" ]] && MTLS_ACTIVE=1
         fi
     else
-        # Don't fail the whole run if we can't reach the CA URL — keep using current CA.
-        log_warn "origin-pull CA fetch failed; continuing with existing CA"
+        log_warn "origin-pull CA fetch failed"
+        [[ -s "$CFO_AOP_CA_FILE" ]] && MTLS_ACTIVE=1
+    fi
+
+    if (( MTLS_ACTIVE == 0 )); then
+        # No CA available at all. In deploy mode this would silently weaken the
+        # posture the operator asked for — refuse. In test mode, warn and observe.
+        if [[ "$CFO_MODE" == "deploy" ]]; then
+            die "mTLS enabled but no origin-pull CA available (fetch failed, no cached CA) — refusing to deploy without it"
+        fi
+        log_warn "TEST MODE: mTLS requested but no CA available yet — TLS verify disabled this round"
     fi
 fi
 
-# ---- 5. Render nginx snippets ------------------------------------------------
+# ---- 6. Render nginx files -----------------------------------------------------
+MAPS_NEW="${WORK_DIR}/maps.conf"
+REALIP_NEW="${WORK_DIR}/realip.conf"
+ENFORCE_NEW="${WORK_DIR}/enforce.conf"
+MTLS_NEW="${WORK_DIR}/mtls.conf"
+STAMP="$(date -u +%FT%TZ)"
+
+# 6a. realip: trust CF-Connecting-IP from every Cloudflare-trusted source.
 {
-    echo "# Generated by cf-owntracks-refresh on $(date -u +%FT%TZ)"
-    echo "# DO NOT EDIT — managed file"
+    echo "# Generated by cf-owntracks-refresh ${STAMP} — DO NOT EDIT"
     echo "real_ip_header CF-Connecting-IP;"
     echo "real_ip_recursive on;"
-    while IFS= read -r cidr; do
-        [[ -n "$cidr" ]] && echo "set_real_ip_from ${cidr};"
-    done < "$V4_VALID"
-    while IFS= read -r cidr; do
-        [[ -n "$cidr" ]] && echo "set_real_ip_from ${cidr};"
-    done < "$V6_VALID"
+    while IFS= read -r c; do [[ -n "$c" ]] && echo "set_real_ip_from ${c};"; done < "$V4_VALID"
+    while IFS= read -r c; do [[ -n "$c" ]] && echo "set_real_ip_from ${c};"; done < "$V6_VALID"
+    while IFS= read -r c; do [[ -n "$c" ]] && echo "set_real_ip_from ${c};"; done < "$ASN4_FINAL"
+    while IFS= read -r c; do [[ -n "$c" ]] && echo "set_real_ip_from ${c};"; done < "$ASN6_FINAL"
 } > "$REALIP_NEW"
 
+# 6b. maps: source classification (geo on the *connection* address), verdict,
+#     reason, and the NDJSON log format.
 {
-    echo "# Generated by cf-owntracks-refresh on $(date -u +%FT%TZ)"
-    echo "# DO NOT EDIT — managed file"
-    while IFS= read -r cidr; do
-        [[ -n "$cidr" ]] && echo "allow ${cidr};"
-    done < "$V4_VALID"
-    while IFS= read -r cidr; do
-        [[ -n "$cidr" ]] && echo "allow ${cidr};"
-    done < "$V6_VALID"
-    echo "deny all;"
-} > "$ALLOW_NEW"
+    echo "# Generated by cf-owntracks-refresh ${STAMP} — DO NOT EDIT"
+    echo "# Source classification keyed on the physical connection address."
+    echo "geo \$realip_remote_addr \$cfo_src_class {"
+    echo "    default                would_block;"
+    echo "    127.0.0.0/8            allowed_localhost;"
+    echo "    ::1                    allowed_localhost;"
+    while IFS= read -r c; do [[ -n "$c" ]] && echo "    ${c} allowed_whitelist;"; done < "$ALLOW4"
+    while IFS= read -r c; do [[ -n "$c" ]] && echo "    ${c} allowed_whitelist;"; done < "$ALLOW6"
+    while IFS= read -r c; do [[ -n "$c" ]] && echo "    ${c} allowed_cloudflare_list;"; done < "$V4_VALID"
+    while IFS= read -r c; do [[ -n "$c" ]] && echo "    ${c} allowed_cloudflare_list;"; done < "$V6_VALID"
+    while IFS= read -r c; do [[ -n "$c" ]] && echo "    ${c} allowed_cloudflare_asn;"; done < "$ASN4_FINAL"
+    while IFS= read -r c; do [[ -n "$c" ]] && echo "    ${c} allowed_cloudflare_asn;"; done < "$ASN6_FINAL"
+    echo "}"
+    echo
+    if (( MTLS_ACTIVE == 1 )); then
+        cat <<'EOF'
+# would_block: 1 unless the source class (and, over https, a valid Cloudflare
+# edge client certificate) says otherwise. mTLS ACTIVE.
+map "$scheme:$cfo_src_class:$ssl_client_verify" $cfo_would_block {
+    default                                        1;
+    "~^https?:allowed_localhost:"                  0;
+    "~^https?:allowed_whitelist:"                  0;
+    "~^http:allowed_cloudflare_list:"              0;
+    "~^http:allowed_cloudflare_asn:"               0;
+    "~^https:allowed_cloudflare_list:SUCCESS$"     0;
+    "~^https:allowed_cloudflare_asn:SUCCESS$"      0;
+}
+map "$scheme:$cfo_src_class:$ssl_client_verify" $cfo_reason {
+    default                                        "ip_not_cloudflare";
+    "~^https?:allowed_localhost:"                  "allowed_localhost";
+    "~^https?:allowed_whitelist:"                  "allowed_whitelist";
+    "~^http:allowed_cloudflare_list:"              "allowed_cloudflare_list";
+    "~^http:allowed_cloudflare_asn:"               "allowed_cloudflare_asn";
+    "~^https:allowed_cloudflare_list:SUCCESS$"     "allowed_cloudflare_list";
+    "~^https:allowed_cloudflare_asn:SUCCESS$"      "allowed_cloudflare_asn";
+    "~^https:allowed_cloudflare_list:"             "mtls_no_valid_cert";
+    "~^https:allowed_cloudflare_asn:"              "mtls_no_valid_cert";
+}
+EOF
+    else
+        cat <<'EOF'
+# would_block: 1 unless the source class says otherwise. mTLS INACTIVE.
+map "$scheme:$cfo_src_class:$ssl_client_verify" $cfo_would_block {
+    default                                        1;
+    "~^https?:allowed_localhost:"                  0;
+    "~^https?:allowed_whitelist:"                  0;
+    "~^https?:allowed_cloudflare_list:"            0;
+    "~^https?:allowed_cloudflare_asn:"             0;
+}
+map "$scheme:$cfo_src_class:$ssl_client_verify" $cfo_reason {
+    default                                        "ip_not_cloudflare";
+    "~^https?:allowed_localhost:"                  "allowed_localhost";
+    "~^https?:allowed_whitelist:"                  "allowed_whitelist";
+    "~^https?:allowed_cloudflare_list:"            "allowed_cloudflare_list";
+    "~^https?:allowed_cloudflare_asn:"             "allowed_cloudflare_asn";
+}
+EOF
+    fi
+    echo
+    cat <<'EOF'
+# One JSON object per line: machine-parseable, human-scannable.
+log_format cfo_ndjson escape=json '{"ts":"$time_iso8601",'
+    '"conn_ip":"$realip_remote_addr","client_ip":"$remote_addr",'
+    '"host":"$host","method":"$request_method","uri":"$request_uri",'
+    '"status":$status,"tls_verify":"$ssl_client_verify",'
+    '"src_class":"$cfo_src_class","would_block":$cfo_would_block,'
+    '"reason":"$cfo_reason"}';
+EOF
+} > "$MAPS_NEW"
 
-if [[ "${CFO_MTLS_ENABLED}" == "1" ]]; then
-    cat > "$MTLS_NEW" <<EOF
-# Generated by cf-owntracks-refresh on $(date -u +%FT%TZ)
-# DO NOT EDIT — managed file
-ssl_client_certificate ${CFO_AOP_CA_FILE};
-ssl_verify_client on;
+# 6c. enforce snippet — included by both managed server blocks.
+if [[ "$CFO_MODE" == "deploy" ]]; then
+    cat > "$ENFORCE_NEW" <<EOF
+# Generated by cf-owntracks-refresh ${STAMP} — DO NOT EDIT
+# DEPLOY MODE: reject anything that isn't Cloudflare, localhost, or whitelisted.
+if (\$cfo_would_block) {
+    return 403;
+}
+EOF
+else
+    cat > "$ENFORCE_NEW" <<EOF
+# Generated by cf-owntracks-refresh ${STAMP} — DO NOT EDIT
+# TEST MODE: enforcement OFF. Every request is recorded in the decision log.
+access_log ${CFO_DECISION_LOG} cfo_ndjson;
 EOF
 fi
 
-# ---- 6. Render firewall ruleset ---------------------------------------------
+# 6d. mtls snippet.
+if (( MTLS_ACTIVE == 1 )); then
+    cat > "$MTLS_NEW" <<EOF
+# Generated by cf-owntracks-refresh ${STAMP} — DO NOT EDIT
+# Authenticated Origin Pulls: verify optionally; enforcement happens via the
+# would_block map (403), so whitelisted IPs can connect without an edge cert.
+ssl_client_certificate ${CFO_AOP_CA_FILE};
+ssl_verify_client optional;
+EOF
+else
+    cat > "$MTLS_NEW" <<EOF
+# Generated by cf-owntracks-refresh ${STAMP} — DO NOT EDIT
+# mTLS inactive (disabled in config, or no origin-pull CA available yet).
+EOF
+fi
+
+# ---- 7. Render firewall --------------------------------------------------------
+NFT_NEW="${WORK_DIR}/ruleset.nft"
+IPT_V4_NEW="${WORK_DIR}/ruleset.v4"
+IPT_V6_NEW="${WORK_DIR}/ruleset.v6"
+
 case "${CFO_FW_BACKEND}" in
     nftables)
-        nftables_render "$V4_VALID" "$V6_VALID" > "$NFT_NEW"
-        if ! nftables_check "$NFT_NEW" >/dev/null; then
-            die "nftables ruleset failed validation"
-        fi
+        nftables_render "$CFO_MODE" "$PORTS_CSV" "$SSH_CSV" \
+            "$V4_VALID" "$V6_VALID" "$ASN4_FINAL" "$ASN6_FINAL" "$ALLOW4" "$ALLOW6" > "$NFT_NEW"
+        nftables_check "$NFT_NEW" >/dev/null || die "nftables ruleset failed validation"
         ;;
     iptables)
-        iptables_render_v4 "$V4_VALID" > "$IPT_V4_NEW"
-        iptables_render_v6 "$V6_VALID" > "$IPT_V6_NEW"
-        if ! iptables_check "$IPT_V4_NEW" "$IPT_V6_NEW" >/dev/null; then
-            die "iptables ruleset failed validation"
-        fi
+        iptables_render_v4 "$CFO_MODE" "$PORTS_CSV" "$SSH_CSV" "$V4_VALID" "$ASN4_FINAL" "$ALLOW4" > "$IPT_V4_NEW"
+        iptables_render_v6 "$CFO_MODE" "$PORTS_CSV" "$SSH_CSV" "$V6_VALID" "$ASN6_FINAL" "$ALLOW6" > "$IPT_V6_NEW"
+        iptables_check "$IPT_V4_NEW" "$IPT_V6_NEW" >/dev/null || die "iptables ruleset failed validation"
         ;;
     ufw)
-        : # ufw applies imperatively; no separate render step
+        : # imperative; applied below
         ;;
 esac
 
-# ---- 7. Backup existing files (for rollback) --------------------------------
-[[ -f "$CFO_NGINX_REALIP_SNIPPET" ]] && cp -p "$CFO_NGINX_REALIP_SNIPPET" "$REALIP_BAK"
-[[ -f "$CFO_NGINX_ALLOW_SNIPPET" ]]  && cp -p "$CFO_NGINX_ALLOW_SNIPPET"  "$ALLOW_BAK"
-[[ -f "$CFO_NGINX_MTLS_SNIPPET" ]]   && cp -p "$CFO_NGINX_MTLS_SNIPPET"   "$MTLS_BAK"
+# ---- 8. Backup current state (full rollback set) --------------------------------
+BAK_DIR="${WORK_DIR}/bak"
+mkdir -p "$BAK_DIR"
+for f in "$CFO_NGINX_MAPS_CONF" "$CFO_NGINX_REALIP_SNIPPET" \
+         "$CFO_NGINX_ENFORCE_SNIPPET" "$CFO_NGINX_MTLS_SNIPPET" \
+         "$CFO_AOP_CA_FILE" "$CFO_AOP_CA_HASH"; do
+    [[ -f "$f" ]] && cp -p "$f" "$BAK_DIR/$(basename "$f")"
+done
 
+FW_BAK="${WORK_DIR}/firewall.bak"
 case "${CFO_FW_BACKEND}" in
     nftables) nftables_snapshot "$FW_BAK" ;;
     ufw)      ufw_snapshot "$FW_BAK" ;;
     iptables) iptables_snapshot "$FW_BAK" ;;
 esac
 
-# ---- 8. Apply nginx snippets, test, reload ----------------------------------
-log_info "installing new nginx snippets"
-install -m 0644 "$REALIP_NEW" "$CFO_NGINX_REALIP_SNIPPET"
-install -m 0644 "$ALLOW_NEW"  "$CFO_NGINX_ALLOW_SNIPPET"
-if [[ "${CFO_MTLS_ENABLED}" == "1" ]]; then
-    install -m 0644 "$MTLS_NEW" "$CFO_NGINX_MTLS_SNIPPET"
-    if (( AOP_NEEDS_UPDATE == 1 )) && [[ -s "$AOP_CA_NEW" ]]; then
-        mkdir -p "$(dirname "$CFO_AOP_CA_FILE")"
-        install -m 0644 "$AOP_CA_NEW" "$CFO_AOP_CA_FILE"
-        sha256sum "$CFO_AOP_CA_FILE" | awk '{print $1}' > "$CFO_AOP_CA_HASH"
-        log_info "updated origin-pull CA cert"
-    fi
-fi
-
 rollback_nginx() {
-    log_warn "rolling back nginx snippets"
-    [[ -f "$REALIP_BAK" ]] && cp -p "$REALIP_BAK" "$CFO_NGINX_REALIP_SNIPPET" || rm -f "$CFO_NGINX_REALIP_SNIPPET"
-    [[ -f "$ALLOW_BAK" ]]  && cp -p "$ALLOW_BAK"  "$CFO_NGINX_ALLOW_SNIPPET"  || rm -f "$CFO_NGINX_ALLOW_SNIPPET"
-    [[ -f "$MTLS_BAK" ]]   && cp -p "$MTLS_BAK"   "$CFO_NGINX_MTLS_SNIPPET"   || rm -f "$CFO_NGINX_MTLS_SNIPPET"
+    log_warn "rolling back nginx state (snippets + CA)"
+    local f base
+    for f in "$CFO_NGINX_MAPS_CONF" "$CFO_NGINX_REALIP_SNIPPET" \
+             "$CFO_NGINX_ENFORCE_SNIPPET" "$CFO_NGINX_MTLS_SNIPPET" \
+             "$CFO_AOP_CA_FILE" "$CFO_AOP_CA_HASH"; do
+        base="$(basename "$f")"
+        if [[ -f "$BAK_DIR/$base" ]]; then
+            cp -p "$BAK_DIR/$base" "$f"
+        else
+            rm -f "$f"
+        fi
+    done
 }
+
+# ---- 9. Install nginx files, test, reload ---------------------------------------
+log_info "installing nginx configuration"
+if (( AOP_CA_STAGED == 1 )); then
+    install -d -m 0755 "$(dirname "$CFO_AOP_CA_FILE")"
+    install -m 0644 "$AOP_CA_NEW" "$CFO_AOP_CA_FILE"
+    sha256sum "$CFO_AOP_CA_FILE" | awk '{print $1}' > "$CFO_AOP_CA_HASH"
+fi
+install -d -m 0755 /etc/nginx/snippets /etc/nginx/conf.d
+install -m 0644 "$MAPS_NEW"    "$CFO_NGINX_MAPS_CONF"
+install -m 0644 "$REALIP_NEW"  "$CFO_NGINX_REALIP_SNIPPET"
+install -m 0644 "$ENFORCE_NEW" "$CFO_NGINX_ENFORCE_SNIPPET"
+install -m 0644 "$MTLS_NEW"    "$CFO_NGINX_MTLS_SNIPPET"
 
 if ! nginx -t 2>&1; then
     rollback_nginx
-    nginx -t >/dev/null 2>&1 || log_error "nginx config is broken even after rollback — manual intervention required"
-    die "nginx -t failed with new snippets; rolled back"
+    nginx -t >/dev/null 2>&1 || log_error "nginx config broken even after rollback — manual attention required"
+    die "nginx -t failed with new configuration; rolled back"
 fi
-
 if ! nginx -s reload 2>&1; then
     rollback_nginx
     nginx -s reload >/dev/null 2>&1 || log_error "nginx reload failed even after rollback"
     die "nginx reload failed; rolled back"
 fi
 
-# ---- 9. Apply firewall (with rollback on failure) ---------------------------
-log_info "applying firewall changes"
-fw_apply_failed=0
+# ---- 10. Apply firewall (rollback everything on failure) ------------------------
+log_info "applying firewall (backend=${CFO_FW_BACKEND}, mode=${CFO_MODE})"
+fw_failed=0
 case "${CFO_FW_BACKEND}" in
-    nftables) nftables_apply "$NFT_NEW"             || fw_apply_failed=1 ;;
-    ufw)      ufw_apply      "$V4_VALID" "$V6_VALID" || fw_apply_failed=1 ;;
-    iptables) iptables_apply "$IPT_V4_NEW" "$IPT_V6_NEW" || fw_apply_failed=1 ;;
+    nftables) nftables_apply "$NFT_NEW" || fw_failed=1 ;;
+    ufw)      ufw_apply "$CFO_MODE" "$PORTS_CSV" \
+                  "$V4_VALID" "$V6_VALID" "$ASN4_FINAL" "$ASN6_FINAL" "$ALLOW4" "$ALLOW6" || fw_failed=1 ;;
+    iptables) iptables_apply "$IPT_V4_NEW" "$IPT_V6_NEW" "$PORTS_CSV" || fw_failed=1 ;;
 esac
 
-if (( fw_apply_failed == 1 )); then
-    log_error "firewall apply failed; rolling back nginx and firewall"
+if (( fw_failed == 1 )); then
+    log_error "firewall apply failed; rolling back firewall and nginx"
     case "${CFO_FW_BACKEND}" in
         nftables) nftables_restore "$FW_BAK" ;;
-        ufw)      ufw_restore      "$FW_BAK" ;;
+        ufw)      ufw_restore "$FW_BAK" ;;
         iptables) iptables_restore "$FW_BAK" ;;
     esac
     rollback_nginx
@@ -220,16 +385,23 @@ if (( fw_apply_failed == 1 )); then
     die "firewall apply failed; state restored"
 fi
 
-# Persist firewall changes across reboot (best-effort)
 case "${CFO_FW_BACKEND}" in
     nftables) nftables_persist ;;
     ufw)      ufw_persist ;;
     iptables) iptables_persist ;;
 esac
 
-# ---- 10. Promote last-known-good --------------------------------------------
+# ---- 11. Housekeeping ------------------------------------------------------------
+if [[ "$CFO_MODE" == "test" ]]; then
+    install -d -m 0755 "$CFO_LOG_DIR"
+    rotate_decision_log "$CFO_TEST_LOG_MAX_MB"
+fi
+
 mkdir -p "$CFO_STATE_DIR"
 install -m 0644 "$V4_VALID" "$CFO_IPS_V4_FILE"
 install -m 0644 "$V6_VALID" "$CFO_IPS_V6_FILE"
+install -m 0644 "$ASN4_FINAL" "$CFO_ASN_V4_FILE"
+install -m 0644 "$ASN6_FINAL" "$CFO_ASN_V6_FILE"
+printf '%s\n' $MANAGED_PORTS > "$CFO_PORTS_FILE"
 
-log_info "refresh complete: ${v4_count} IPv4 + ${v6_count} IPv6 ranges; mtls=${CFO_MTLS_ENABLED}"
+log_info "refresh complete: mode=${CFO_MODE} ports=[${MANAGED_PORTS}] published=${v4_count}v4+${v6_count}v6 asn_novel=${asn4_count}v4+${asn6_count}v6 allowlist=${allow_count} mtls_active=${MTLS_ACTIVE}"

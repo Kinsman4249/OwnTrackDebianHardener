@@ -3,16 +3,20 @@ Description=Refresh Cloudflare allowlist for OwnTracks (firewall + nginx)
 Documentation=file:///usr/local/share/cf-owntracks/README.md
 After=network-online.target nginx.service
 Wants=network-online.target
+# Transient failure? Try again in ~30 minutes instead of waiting for the
+# next scheduled tick. The retry timer fires cf-owntracks.service once.
+OnFailure=cf-owntracks-retry.timer
 
 [Service]
 Type=oneshot
 ExecStart=/usr/local/sbin/cf-owntracks-refresh
 
 # --- Hardening ---------------------------------------------------------------
-# We need root (firewall, nginx reload). We narrow the writable surface via
-# ProtectSystem=strict + ReadWritePaths. We do NOT use PrivateNetwork (need
-# outbound HTTPS to cloudflare.com) and we keep ambient capabilities (nft and
-# iptables need CAP_NET_ADMIN; nginx reload needs to signal pid 1 of nginx).
+# Root is required (firewall, nginx reload). The writable surface is narrowed
+# via ProtectSystem=strict + an explicit ReadWritePaths allowlist.
+# v2 fix: firewall persistence paths (/etc/nftables.d, /etc/nftables.conf,
+# /etc/ufw, /etc/iptables) and the decision-log dir were missing in v1, which
+# made persistence writes fail silently under the timer.
 ProtectSystem=strict
 ProtectHome=true
 ProtectKernelTunables=true
@@ -22,15 +26,11 @@ RestrictSUIDSGID=true
 NoNewPrivileges=true
 PrivateTmp=true
 LockPersonality=true
-MemoryDenyWriteExecute=true
 RestrictRealtime=true
 RestrictNamespaces=true
-# Paths the daemon legitimately writes to.
-ReadWritePaths=/etc/nginx /etc/cf-owntracks /var/lib/cf-owntracks /etc/ssl/cloudflare /run /var/log
+ReadWritePaths=/etc/nginx /etc/cf-owntracks /var/lib/cf-owntracks /etc/ssl/cloudflare /run /var/log /var/log/cf-owntracks /etc/nftables.d /etc/nftables.conf /etc/ufw /etc/iptables
 
 TimeoutStartSec=300
-# Don't restart on failure — the timer will pick it up tomorrow. A failed run
-# means we kept the previous safe state, which is the correct behavior.
 Restart=no
 
 [Install]

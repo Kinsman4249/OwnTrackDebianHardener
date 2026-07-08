@@ -1,14 +1,15 @@
 [Unit]
-Description=Daily refresh of Cloudflare allowlist for OwnTracks
+Description=Periodic refresh of Cloudflare allowlist for OwnTracks
 Documentation=file:///usr/local/share/cf-owntracks/README.md
 
 [Timer]
-# Daily at a randomized offset so we don't stampede Cloudflare at midnight UTC.
-OnCalendar=daily
-RandomizedDelaySec=1h
-# Catch up on missed runs (e.g., laptop suspended overnight, server was down).
+# Every 6 hours with a randomized offset — ranges stay current with zero
+# sysadmin involvement, without stampeding Cloudflare on the hour.
+# The installer patches OnCalendar when --refresh-interval is given.
+OnCalendar=*-*-* 00/6:00:00
+RandomizedDelaySec=30m
+# Catch up on missed runs (host was down/suspended).
 Persistent=true
-# Don't fire immediately if the timer is enabled mid-day; wait for the schedule.
 AccuracySec=1m
 
 [Install]

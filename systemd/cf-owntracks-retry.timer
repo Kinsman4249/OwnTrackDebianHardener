@@ -1,0 +1,16 @@
+[Unit]
+Description=One-shot retry after a failed cf-owntracks refresh
+Documentation=file:///usr/local/share/cf-owntracks/README.md
+
+[Timer]
+# Activated by cf-owntracks.service's OnFailure=. Fires the service once,
+# ~30 minutes after the failure, then deactivates. If that run fails too,
+# OnFailure re-activates this timer — effectively retrying every ~30 minutes
+# until a run succeeds or the regular schedule takes over.
+OnActiveSec=30min
+AccuracySec=1m
+RemainAfterElapse=no
+Unit=cf-owntracks.service
+
+# No [Install] section on purpose: this timer is never enabled at boot; it
+# only ever runs when activated by OnFailure=.

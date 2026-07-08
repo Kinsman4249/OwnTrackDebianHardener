@@ -1,5 +1,15 @@
-# cf-owntracks daemon config — managed by installer.
-# Shell variable syntax (sourced by bash). Quote values containing spaces.
+# cf-owntracks daemon config (v2) — managed by installer.
+# Shell variable syntax (sourced by bash). Edit + run
+# `systemctl start cf-owntracks.service` to apply changes.
+
+# Version marker written by the installer (informational).
+CFO_VERSION="2.0.0"
+
+# Operating mode:
+#   test    — DEFAULT. Everything runs live but NOTHING enforces. Would-block
+#             decisions are recorded in /var/log/cf-owntracks/decisions.ndjson.
+#   deploy  — Full enforcement (firewall drops, nginx 403s, mTLS verified).
+CFO_MODE="test"
 
 # Public FQDN of the OwnTracks vhost (must match the Cloudflare hostname).
 CFO_SERVER_NAME="owntracks.example.com"
@@ -8,17 +18,33 @@ CFO_SERVER_NAME="owntracks.example.com"
 CFO_OWNTRACKS_PORT=8083
 
 # Firewall backend the daemon manages. One of: nftables, ufw, iptables.
-# Set at install time by autodetection (or --force).
 CFO_FW_BACKEND="nftables"
 
 # TLS material for the 443 vhost.
 CFO_TLS_CERT="/etc/ssl/cloudflare/origin.pem"
 CFO_TLS_KEY="/etc/ssl/cloudflare/origin.key"
 
-# Authenticated Origin Pulls (mTLS): 1 = enforce, 0 = disabled.
-# Requires the AOP toggle to be ON in the Cloudflare dashboard for this zone.
+# Authenticated Origin Pulls (mTLS): 1 = on (default), 0 = off.
+# Requires the AOP toggle in the Cloudflare dashboard for the zone.
 CFO_MTLS_ENABLED=1
 
 # Whether the optional global 80->443 redirect default_server was installed.
-# Informational only; the actual file is /etc/nginx/sites-enabled/00-cf-global-redirect.conf
 CFO_GLOBAL_REDIRECT=0
+
+# ASN failsafe: also allow prefixes announced by Cloudflare's ASN(s) that the
+# published lists miss. 1 = on (default), 0 = off.
+CFO_ASN_FAILSAFE=1
+
+# Space-separated Cloudflare ASNs for the failsafe lookup.
+CFO_CF_ASNS="13335"
+
+# Extra nginx ports to manage beyond the managed vhosts' own listen ports
+# (space-separated). Ports also used by SSH are ALWAYS excluded.
+CFO_EXTRA_PORTS=""
+
+# Decision log size cap in MB (test mode). Rotated to .1 when exceeded.
+CFO_TEST_LOG_MAX_MB=15
+
+# Operator allowlist lives in /etc/cf-owntracks/allowlist (one IP/CIDR per
+# line, # comments allowed). Those sources are ALWAYS allowed on the managed
+# ports, in both modes, at both the firewall and nginx layers.

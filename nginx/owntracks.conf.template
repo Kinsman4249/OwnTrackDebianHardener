@@ -1,11 +1,16 @@
-# cf-owntracks: OwnTracks vhost (templated by installer)
+# cf-owntracks: OwnTracks vhost (templated by installer, v2)
 #
 # Substitutions performed at install time:
 #   __SERVER_NAME__    public hostname (e.g. owntracks.example.com)
 #   __OWNTRACKS_PORT__ local recorder port (default 8083)
 #   __TLS_CERT__       fullchain cert path
 #   __TLS_KEY__        private key path
-#   __MTLS_INCLUDE__   include directive for mTLS snippet (blank if disabled)
+#
+# Behavior is mode-driven via the daemon-generated snippets:
+#   snippets/cloudflare-realip.conf   real client IP from CF-Connecting-IP
+#   snippets/cloudflare-enforce.conf  TEST: decision log / DEPLOY: 403 gate
+#   snippets/cloudflare-mtls.conf     Authenticated Origin Pulls (optional verify)
+#   conf.d/cf-owntracks-maps.conf     geo classification + verdict maps + log format
 
 # --- Port 80: redirect-only ---------------------------------------------------
 server {
@@ -13,14 +18,15 @@ server {
     listen [::]:80;
     server_name __SERVER_NAME__;
 
-    # Firewall already restricts source to Cloudflare; we just bounce to https.
+    include /etc/nginx/snippets/cloudflare-realip.conf;
+    include /etc/nginx/snippets/cloudflare-enforce.conf;
+
     return 301 https://$host$request_uri;
 }
 
 # --- Port 443: the actual app ------------------------------------------------
 server {
     # nginx 1.22 (Debian 12 bookworm) uses old-style http2 on the listen directive.
-    # nginx 1.25+ prefers a separate `http2 on;` line, but that fails to parse on 1.22.
     listen      443 ssl http2;
     listen [::]:443 ssl http2;
     server_name __SERVER_NAME__;
@@ -33,14 +39,9 @@ server {
     ssl_session_cache   shared:cfo:10m;
     ssl_session_timeout 10m;
 
-    # Cloudflare real-ip rewrite (managed by cf-owntracks)
     include /etc/nginx/snippets/cloudflare-realip.conf;
-
-    # Belt-and-suspenders: nginx-level allow/deny (post real-ip rewrite)
-    include /etc/nginx/snippets/cloudflare-allow.conf;
-
-    # Authenticated Origin Pulls (mTLS) — installer leaves the include or comments it
-    __MTLS_INCLUDE__
+    include /etc/nginx/snippets/cloudflare-mtls.conf;
+    include /etc/nginx/snippets/cloudflare-enforce.conf;
 
     # OwnTracks payload sizes can exceed nginx default (1m)
     client_max_body_size 4m;

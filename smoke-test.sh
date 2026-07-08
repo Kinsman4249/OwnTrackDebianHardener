@@ -1,294 +1,288 @@
 #!/usr/bin/env bash
-# cf-owntracks smoke test
+# cf-owntracks smoke test (v2 — mode-aware)
 #
-# Verifies the daemon installed correctly and the security posture is as
-# expected. Designed to run on the origin box OR from any internet-connected
-# machine.
+# Local checks (run on the origin, as root):
+#   - systemd timer active + enabled; retry timer unit installed
+#   - config present; mode banner
+#   - last-known-good caches (published + ASN) present
+#   - nginx pieces present, nginx -t passes
+#   - firewall rules loaded for the configured backend
+#   - managed ports have listeners; SSH ports are NOT in the managed set
+#   - SSH ports still accept TCP connections (locally verifiable)
+#   - test mode: decision log exists and lines parse as NDJSON-ish
 #
-# Local checks (only meaningful when run on origin):
-#   - systemd timer is active and enabled
-#   - config file exists
-#   - last-known-good IP files exist and are non-empty
-#   - nginx snippets exist, nginx -t passes
-#   - firewall has CF rules loaded for the detected backend
-#   - port 443 has a listener
-#   - mTLS CA cert exists (if mTLS enabled)
-#
-# Remote checks (run from anywhere — origin or your laptop):
-#   - HTTPS via Cloudflare DNS returns 2xx/3xx — site is reachable for real users
-#   - HTTP via Cloudflare returns 301 to https
-#   - Direct connection to origin IP on :443 (bypassing CF) has the expected
-#     failure mode:
-#       * mTLS on: TLS handshake fails ("alert handshake failure" or "no
-#         required SSL certificate")
-#       * mTLS off: HTTP 403 from nginx allow/deny (real client IP isn't CF)
-#   - Direct connection to origin IP on :80 (bypassing CF) is dropped at the
-#     firewall (timeout) — the *only* way to verify the firewall is doing its
-#     job from a non-CF source IP
+# Remote checks (run from anywhere; needs --server-name; --origin-ip for the
+# direct-to-origin probes):
+#   - HTTPS via Cloudflare returns 2xx/3xx
+#   - HTTP via Cloudflare returns a 301 redirect
+#   - Direct-to-origin behavior matches the mode:
+#       deploy+mTLS: TLS handshake/403 failure    deploy no-mTLS: 403
+#       test: request SUCCEEDS (observe only — it should be logged instead)
+#   - Direct HTTP to origin: deploy = dropped (timeout); test = reachable
 #
 # Usage:
-#   sudo ./smoke-test.sh                          # auto-load config, all checks
-#   ./smoke-test.sh --server-name owntracks.example.com --origin-ip 203.0.113.5
-#   ./smoke-test.sh --local-only                  # only on-box checks
-#   ./smoke-test.sh --remote-only                 # only network checks
-#   ./smoke-test.sh --skip-direct                 # don't try direct-to-origin
+#   sudo ./smoke-test.sh                          # on origin: local + remote
+#   ./smoke-test.sh --server-name x --origin-ip Y --remote-only
+#   sudo ./smoke-test.sh --local-only
 #
-# Exit code: 0 if all checks pass, 1 if any fail.
+# Exit code: 0 if no FAILs.
 
 set -Eeuo pipefail
 
-# ---- Config / args ----------------------------------------------------------
 SERVER_NAME=""
 ORIGIN_IP=""
-MODE="all"            # all | local-only | remote-only
+MODE_FLAG="all"
 SKIP_DIRECT=0
-EXPECTED_MTLS=""      # 0, 1, or "" for "auto-detect from config"
-TIMEOUT_DIRECT_DROP=6 # how long to wait before declaring "dropped" on :80
+EXPECTED_MODE=""
+EXPECTED_MTLS=""
+TIMEOUT_DIRECT_DROP=6
 
-usage() { sed -n '2,37p' "$0"; }
+usage() { sed -n '2,30p' "$0"; }
 
 while (( $# )); do
     case "$1" in
-        --server-name)    SERVER_NAME="$2"; shift 2 ;;
-        --origin-ip)      ORIGIN_IP="$2"; shift 2 ;;
-        --local-only)     MODE="local-only"; shift ;;
-        --remote-only)    MODE="remote-only"; shift ;;
-        --skip-direct)    SKIP_DIRECT=1; shift ;;
-        --mtls)           EXPECTED_MTLS="$2"; shift 2 ;;
-        -h|--help)        usage; exit 0 ;;
+        --server-name)  SERVER_NAME="$2"; shift 2 ;;
+        --origin-ip)    ORIGIN_IP="$2"; shift 2 ;;
+        --local-only)   MODE_FLAG="local-only"; shift ;;
+        --remote-only)  MODE_FLAG="remote-only"; shift ;;
+        --skip-direct)  SKIP_DIRECT=1; shift ;;
+        --mode)         EXPECTED_MODE="$2"; shift 2 ;;
+        --mtls)         EXPECTED_MTLS="$2"; shift 2 ;;
+        -h|--help)      usage; exit 0 ;;
         *) echo "unknown option: $1" >&2; usage; exit 2 ;;
     esac
 done
 
-# Best-effort: load installed config to fill in defaults.
 CFG="/etc/cf-owntracks/config"
 if [[ -r "$CFG" ]]; then
     # shellcheck disable=SC1090
     source "$CFG"
     SERVER_NAME="${SERVER_NAME:-${CFO_SERVER_NAME:-}}"
+    EXPECTED_MODE="${EXPECTED_MODE:-${CFO_MODE:-}}"
     EXPECTED_MTLS="${EXPECTED_MTLS:-${CFO_MTLS_ENABLED:-}}"
 fi
+EXPECTED_MODE="${EXPECTED_MODE:-deploy}"
+EXPECTED_MTLS="${EXPECTED_MTLS:-1}"
 
-[[ -n "$SERVER_NAME" ]] || { echo "ERROR: --server-name required (or run on origin with /etc/cf-owntracks/config readable)" >&2; exit 2; }
+if [[ "$MODE_FLAG" != "local-only" ]] && [[ -z "$SERVER_NAME" ]]; then
+    echo "ERROR: --server-name required for remote checks (or run on origin with $CFG readable)" >&2
+    exit 2
+fi
 
-# ---- Output helpers ---------------------------------------------------------
-PASS_COUNT=0
-FAIL_COUNT=0
-SKIP_COUNT=0
-
+PASS_COUNT=0; FAIL_COUNT=0; SKIP_COUNT=0
 if [[ -t 1 ]]; then
     C_OK=$'\e[32m'; C_FAIL=$'\e[31m'; C_SKIP=$'\e[33m'; C_DIM=$'\e[2m'; C_RST=$'\e[0m'
 else
     C_OK=""; C_FAIL=""; C_SKIP=""; C_DIM=""; C_RST=""
 fi
-
-pass() { printf '%s  PASS%s  %s\n'      "$C_OK"   "$C_RST" "$1"; PASS_COUNT=$((PASS_COUNT+1)); }
+pass() { printf '%s  PASS%s  %s\n' "$C_OK" "$C_RST" "$1"; PASS_COUNT=$((PASS_COUNT+1)); }
 fail() { printf '%s  FAIL%s  %s\n%s        %s%s\n' "$C_FAIL" "$C_RST" "$1" "$C_DIM" "${2:-}" "$C_RST"; FAIL_COUNT=$((FAIL_COUNT+1)); }
-skip() { printf '%s  SKIP%s  %s%s\n%s        %s%s\n' "$C_SKIP" "$C_RST" "$1" "" "$C_DIM" "${2:-}" "$C_RST"; SKIP_COUNT=$((SKIP_COUNT+1)); }
+skip() { printf '%s  SKIP%s  %s\n%s        %s%s\n' "$C_SKIP" "$C_RST" "$1" "$C_DIM" "${2:-}" "$C_RST"; SKIP_COUNT=$((SKIP_COUNT+1)); }
 section() { printf '\n%s== %s ==%s\n' "$C_DIM" "$1" "$C_RST"; }
 
-# ---- Local checks -----------------------------------------------------------
-run_local_checks() {
-    if (( EUID != 0 )); then
-        skip "local checks" "need root to read /etc/cf-owntracks and inspect firewall; rerun with sudo"
-        return 0
-    fi
-
-    section "Local (on-box) checks"
-
-    # systemd timer
-    if systemctl is-active cf-owntracks.timer >/dev/null 2>&1; then
-        pass "systemd timer is active"
-    else
-        fail "systemd timer is active" "$(systemctl is-active cf-owntracks.timer 2>&1 || true)"
-    fi
-    if systemctl is-enabled cf-owntracks.timer >/dev/null 2>&1; then
-        pass "systemd timer is enabled at boot"
-    else
-        fail "systemd timer is enabled at boot" "$(systemctl is-enabled cf-owntracks.timer 2>&1 || true)"
-    fi
-
-    # Config file
-    if [[ -r "$CFG" ]]; then
-        pass "config file present at $CFG"
-    else
-        fail "config file present at $CFG" "not readable"
-    fi
-
-    # Last-known-good IP lists
-    local v4f="/var/lib/cf-owntracks/ips-v4.last"
-    local v6f="/var/lib/cf-owntracks/ips-v6.last"
-    if [[ -s "$v4f" ]]; then
-        local n4; n4=$(grep -c . "$v4f" || true)
-        pass "IPv4 last-known-good list present (${n4} ranges)"
-    else
-        fail "IPv4 last-known-good list" "$v4f missing or empty — refresh has never succeeded"
-    fi
-    if [[ -s "$v6f" ]]; then
-        local n6; n6=$(grep -c . "$v6f" || true)
-        pass "IPv6 last-known-good list present (${n6} ranges)"
-    else
-        fail "IPv6 last-known-good list" "$v6f missing or empty"
-    fi
-
-    # nginx snippets
-    for f in /etc/nginx/snippets/cloudflare-realip.conf /etc/nginx/snippets/cloudflare-allow.conf; do
-        if [[ -s "$f" ]]; then pass "nginx snippet $f exists"
-        else fail "nginx snippet $f exists" "missing or empty"
-        fi
-    done
-    if [[ "${EXPECTED_MTLS:-1}" == "1" ]]; then
-        if [[ -s /etc/nginx/snippets/cloudflare-mtls.conf ]]; then
-            pass "mTLS snippet exists"
-        else
-            fail "mTLS snippet exists" "missing"
-        fi
-        if [[ -s /etc/ssl/cloudflare/authenticated_origin_pull_ca.pem ]] \
-           && openssl x509 -in /etc/ssl/cloudflare/authenticated_origin_pull_ca.pem -noout 2>/dev/null; then
-            pass "Cloudflare origin-pull CA cert valid"
-        else
-            fail "Cloudflare origin-pull CA cert valid" "missing or not a valid x509"
-        fi
-    fi
-
-    # nginx config validity
-    if nginx -t >/dev/null 2>&1; then
-        pass "nginx -t passes"
-    else
-        fail "nginx -t passes" "$(nginx -t 2>&1 | tail -5)"
-    fi
-
-    # Firewall has CF rules loaded
-    if [[ -r "$CFG" ]]; then
-        case "${CFO_FW_BACKEND:-}" in
-            nftables)
-                if nft list table inet cf_owntracks >/dev/null 2>&1 && \
-                   nft list table inet cf_owntracks 2>/dev/null | grep -q 'set cf_v4 {'; then
-                    local nv4 nv6
-                    # Count CIDR-like elements inside cf_v4 / cf_v6 sets.
-                    nv4=$(nft list table inet cf_owntracks 2>/dev/null | awk '/set cf_v4 {/,/}/' | grep -oE '[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+/[0-9]+' | wc -l)
-                    nv6=$(nft list table inet cf_owntracks 2>/dev/null | awk '/set cf_v6 {/,/}/' | grep -oE '[0-9a-fA-F:]+/[0-9]+' | wc -l)
-                    pass "nftables table inet cf_owntracks present (${nv4} v4 + ${nv6} v6 entries)"
-                else
-                    fail "nftables table inet cf_owntracks present" "not found or empty"
-                fi
-                ;;
-            ufw)
-                local c; c=$(ufw status numbered 2>/dev/null | grep -c cf-owntracks || true)
-                if (( c > 0 )); then pass "ufw has $c rules tagged cf-owntracks"
-                else fail "ufw has rules tagged cf-owntracks" "none found"; fi
-                ;;
-            iptables)
-                if iptables -S CF-OWNTRACKS  >/dev/null 2>&1 && \
-                   ip6tables -S CF-OWNTRACKS6 >/dev/null 2>&1; then
-                    pass "iptables chains CF-OWNTRACKS and CF-OWNTRACKS6 present"
-                else
-                    fail "iptables chains CF-OWNTRACKS/CF-OWNTRACKS6 present" "missing"
-                fi
-                ;;
-        esac
-    fi
-
-    # Port 443 listener
-    if ss -ltn '( sport = :443 )' 2>/dev/null | grep -q LISTEN; then
-        pass "something is listening on :443"
-    else
-        fail "something is listening on :443" "no LISTEN state"
-    fi
-
-    # Last successful refresh
-    if journalctl -u cf-owntracks.service --since '1 day ago' 2>/dev/null | grep -q 'refresh complete'; then
-        pass "refresh has succeeded within the last 24h"
-    else
-        skip "refresh has succeeded within the last 24h" "no 'refresh complete' in journal — run: sudo systemctl start cf-owntracks.service"
-    fi
+# TCP connect check without nc: bash /dev/tcp with timeout.
+tcp_open() {
+    local host="$1" port="$2"
+    timeout 4 bash -c "exec 3<>/dev/tcp/${host}/${port}" 2>/dev/null
 }
 
-# ---- Remote / network checks ------------------------------------------------
-run_remote_checks() {
-    section "Remote (network) checks  [$SERVER_NAME]"
+run_local_checks() {
+    if (( EUID != 0 )); then
+        skip "local checks" "need root; rerun with sudo"
+        return 0
+    fi
+    section "Local (on-box) checks — expected mode: ${EXPECTED_MODE^^}"
 
-    # 1. HTTPS through Cloudflare DNS (the normal end-user path)
+    if [[ "$EXPECTED_MODE" == "test" ]]; then
+        echo "  NOTE: TEST mode — enforcement is OFF by design; this host is observing only."
+    fi
+
+    systemctl is-active cf-owntracks.timer >/dev/null 2>&1 \
+        && pass "refresh timer active" || fail "refresh timer active" "$(systemctl is-active cf-owntracks.timer 2>&1 || true)"
+    systemctl is-enabled cf-owntracks.timer >/dev/null 2>&1 \
+        && pass "refresh timer enabled at boot" || fail "refresh timer enabled" ""
+    [[ -f /etc/systemd/system/cf-owntracks-retry.timer ]] \
+        && pass "failure-retry timer installed" || fail "failure-retry timer installed" "missing unit file"
+
+    [[ -r "$CFG" ]] && pass "config present at $CFG" || fail "config present" "missing"
+
+    local v4f="/var/lib/cf-owntracks/ips-v4.last" v6f="/var/lib/cf-owntracks/ips-v6.last"
+    [[ -s "$v4f" ]] && pass "published v4 cache ($(grep -c . "$v4f") ranges)" || fail "published v4 cache" "refresh never succeeded?"
+    [[ -s "$v6f" ]] && pass "published v6 cache ($(grep -c . "$v6f") ranges)" || fail "published v6 cache" ""
+    if [[ "${CFO_ASN_FAILSAFE:-1}" == "1" ]]; then
+        local a4f="/var/lib/cf-owntracks/asn-v4.last"
+        [[ -f "$a4f" ]] && pass "ASN failsafe cache present ($(grep -c . "$a4f" 2>/dev/null || echo 0) novel v4)" \
+                        || skip "ASN failsafe cache" "not created yet"
+    fi
+
+    local f
+    for f in /etc/nginx/conf.d/cf-owntracks-maps.conf \
+             /etc/nginx/snippets/cloudflare-realip.conf \
+             /etc/nginx/snippets/cloudflare-enforce.conf \
+             /etc/nginx/snippets/cloudflare-mtls.conf; do
+        [[ -s "$f" ]] && pass "nginx piece $f" || fail "nginx piece $f" "missing/empty"
+    done
+    nginx -t >/dev/null 2>&1 && pass "nginx -t" || fail "nginx -t" "$(nginx -t 2>&1 | tail -3)"
+
+    # Managed ports vs SSH ports.
+    local managed="" ssh_ports="" p
+    [[ -s /var/lib/cf-owntracks/ports.last ]] && managed="$(tr '\n' ' ' < /var/lib/cf-owntracks/ports.last)"
+    ssh_ports="$( { sed -n 's/^[[:space:]]*[Pp]ort[[:space:]]\+\([0-9]\+\).*/\1/p' /etc/ssh/sshd_config 2>/dev/null; echo 22; } | sort -un | tr '\n' ' ')"
+    if [[ -n "$managed" ]]; then
+        pass "managed ports recorded: ${managed% }"
+        local clash=0
+        for p in $managed; do grep -qw "$p" <<<"$ssh_ports" && clash=1; done
+        (( clash == 0 )) && pass "SSH GUARD: managed set does not include SSH ports (${ssh_ports% })" \
+                         || fail "SSH GUARD" "managed set includes an SSH port!"
+    else
+        fail "managed ports recorded" "/var/lib/cf-owntracks/ports.last missing"
+    fi
+
+    # SSH still answers locally (loopback path exercises the fw input hook).
+    for p in $ssh_ports; do
+        if tcp_open 127.0.0.1 "$p"; then
+            pass "SSH port ${p} accepts connections"
+        else
+            skip "SSH port ${p} connect check" "no local listener (custom setup?)"
+        fi
+    done
+
+    # Listeners on managed ports.
+    for p in $managed; do
+        ss -ltn "( sport = :${p} )" 2>/dev/null | grep -q LISTEN \
+            && pass "listener on :${p}" || fail "listener on :${p}" "nothing listening"
+    done
+
+    # Firewall state.
+    case "${CFO_FW_BACKEND:-}" in
+        nftables)
+            if nft list table inet cf_owntracks >/dev/null 2>&1; then
+                pass "nftables table present"
+                if [[ "$EXPECTED_MODE" == "deploy" ]]; then
+                    nft list table inet cf_owntracks | grep -q ' drop' \
+                        && pass "deploy: drop rule present" || fail "deploy: drop rule present" "no drop found"
+                else
+                    nft list table inet cf_owntracks | grep -q 'log prefix' \
+                        && pass "test: would-block log rule present" || fail "test: log rule present" "no log rule"
+                    nft list table inet cf_owntracks | grep -q ' drop' \
+                        && fail "test: nothing drops" "found a drop rule in TEST mode!" || pass "test: nothing drops"
+                fi
+            else
+                fail "nftables table present" "missing"
+            fi
+            ;;
+        ufw)
+            local c; c=$(ufw status numbered 2>/dev/null | grep -cF 'cf-owntracks' || true)
+            (( c > 0 )) && pass "ufw tagged rules present (${c})" || fail "ufw tagged rules" "none"
+            ;;
+        iptables)
+            iptables -S CF-OWNTRACKS >/dev/null 2>&1 && ip6tables -S CF-OWNTRACKS6 >/dev/null 2>&1 \
+                && pass "iptables chains present" || fail "iptables chains" "missing"
+            ;;
+    esac
+
+    # Decision log (test mode).
+    if [[ "$EXPECTED_MODE" == "test" ]]; then
+        local dlog="/var/log/cf-owntracks/decisions.ndjson"
+        if [[ -s "$dlog" ]]; then
+            local sample; sample="$(tail -1 "$dlog")"
+            if grep -q '"would_block":' <<<"$sample" && grep -q '"reason":"' <<<"$sample"; then
+                pass "decision log parses — last: $(head -c 140 <<<"$sample")"
+            else
+                fail "decision log format" "last line lacks would_block/reason: $(head -c 120 <<<"$sample")"
+            fi
+        else
+            skip "decision log entries" "no traffic recorded yet ($dlog)"
+        fi
+    fi
+
+    journalctl -u cf-owntracks.service --since '1 day ago' 2>/dev/null | grep -q 'refresh complete' \
+        && pass "refresh succeeded within 24h" \
+        || skip "refresh succeeded within 24h" "run: sudo systemctl start cf-owntracks.service"
+}
+
+run_remote_checks() {
+    section "Remote (network) checks  [$SERVER_NAME]  expected mode: ${EXPECTED_MODE^^}"
+
     local code
     code=$(curl -sS --max-time 15 -o /dev/null -w '%{http_code}' "https://${SERVER_NAME}/" 2>/dev/null || echo "000")
     case "$code" in
-        2??|3??) pass "https://${SERVER_NAME}/ via CF returns $code" ;;
-        000)     fail "https://${SERVER_NAME}/ via CF reachable" "curl failed (DNS/SSL/connectivity)" ;;
-        5??)     fail "https://${SERVER_NAME}/ via CF returns 2xx/3xx" "got $code — Cloudflare can reach origin? Check CF dashboard." ;;
-        *)       fail "https://${SERVER_NAME}/ via CF returns 2xx/3xx" "got $code" ;;
+        2??|3??) pass "https via CF returns $code" ;;
+        000)     fail "https via CF reachable" "curl failed (DNS/TLS/connectivity)" ;;
+        *)       fail "https via CF returns 2xx/3xx" "got $code" ;;
     esac
 
-    # 2. HTTP via Cloudflare redirects to HTTPS
     code=$(curl -sS --max-time 15 -o /dev/null -w '%{http_code}' "http://${SERVER_NAME}/" 2>/dev/null || echo "000")
     case "$code" in
-        301|302|307|308) pass "http://${SERVER_NAME}/ via CF returns redirect ($code)" ;;
-        000)             fail "http://${SERVER_NAME}/ via CF reachable" "curl failed" ;;
-        *)               fail "http://${SERVER_NAME}/ via CF returns redirect" "got $code (expected 301)" ;;
+        301|302|307|308) pass "http via CF redirects ($code)" ;;
+        000)             fail "http via CF reachable" "curl failed" ;;
+        *)               fail "http via CF redirects" "got $code (expected 301)" ;;
     esac
 
-    # 3. Direct-to-origin checks (require --origin-ip and a non-CF source IP)
     if (( SKIP_DIRECT == 1 )); then
         skip "direct-to-origin checks" "--skip-direct"
         return 0
     fi
     if [[ -z "$ORIGIN_IP" ]]; then
-        # Try DNS-resolved IP — but that might be a CF anycast IP, not the origin.
-        # We can't reliably tell from DNS alone, so just skip with guidance.
-        skip "direct-to-origin checks" "pass --origin-ip <public-IPv4-of-origin> to test the firewall"
+        skip "direct-to-origin checks" "pass --origin-ip <public-IP> to probe the firewall/mTLS directly"
         return 0
     fi
 
-    # 3a. Direct HTTPS bypassing CF — should fail with handshake or 403
-    local body errfile
+    local errfile body err
     errfile="$(mktemp)"
     body=$(curl -sS --max-time 10 --resolve "${SERVER_NAME}:443:${ORIGIN_IP}" -o /dev/null -w '%{http_code}' "https://${SERVER_NAME}/" 2>"$errfile" || true)
-    local err; err="$(<"$errfile")"
-    rm -f "$errfile"
-    if [[ "${EXPECTED_MTLS:-1}" == "1" ]]; then
-        if [[ "$body" == "000" ]] && grep -qiE 'handshake|certificate|alert' <<<"$err"; then
-            pass "direct https to origin fails TLS handshake (mTLS working): ${err%%$'\n'*}"
-        elif [[ "$body" == "400" ]] && curl -sS --max-time 10 --resolve "${SERVER_NAME}:443:${ORIGIN_IP}" "https://${SERVER_NAME}/" 2>/dev/null | grep -qi 'No required SSL certificate'; then
-            pass "direct https to origin returns 'No required SSL certificate' (mTLS working)"
-        else
-            fail "direct https to origin fails (mTLS enforced)" "got code=$body err=${err:0:120}"
-        fi
+    err="$(<"$errfile")"; rm -f "$errfile"
+
+    if [[ "$EXPECTED_MODE" == "test" ]]; then
+        case "$body" in
+            2??|3??) pass "TEST: direct https to origin succeeds ($body) — will appear in decision log as would_block" ;;
+            *)       fail "TEST: direct https to origin succeeds" "got code=$body err=${err:0:100} (test mode must not block)" ;;
+        esac
     else
-        # mTLS off — connection should succeed at TLS but nginx allow/deny returns 403
-        if [[ "$body" == "403" ]]; then
-            pass "direct https to origin returns 403 (nginx allowlist working)"
+        if [[ "$EXPECTED_MTLS" == "1" ]]; then
+            if [[ "$body" == "000" ]] && grep -qiE 'handshake|certificate|alert' <<<"$err"; then
+                pass "DEPLOY+mTLS: direct https fails TLS (${err%%$'\n'*})"
+            elif [[ "$body" == "403" ]]; then
+                pass "DEPLOY+mTLS: direct https rejected with 403 (no valid edge cert)"
+            else
+                fail "DEPLOY+mTLS: direct https rejected" "got code=$body err=${err:0:100}"
+            fi
         else
-            fail "direct https to origin returns 403" "got code=$body err=${err:0:120}"
+            [[ "$body" == "403" ]] \
+                && pass "DEPLOY: direct https returns 403 (IP gate working)" \
+                || fail "DEPLOY: direct https returns 403" "got code=$body err=${err:0:100}"
         fi
     fi
 
-    # 3b. Direct HTTP bypassing CF — should be DROPPED at the firewall (timeout)
     errfile="$(mktemp)"
     body=$(curl -sS --max-time "$TIMEOUT_DIRECT_DROP" --resolve "${SERVER_NAME}:80:${ORIGIN_IP}" -o /dev/null -w '%{http_code}' "http://${SERVER_NAME}/" 2>"$errfile" || true)
-    err="$(<"$errfile")"
-    rm -f "$errfile"
-    if [[ "$body" == "000" ]] && grep -qiE 'timed? out|timeout|operation timed|connection timed|refused' <<<"$err"; then
-        pass "direct http to origin is dropped by firewall (timeout/refused — what we want)"
-    elif [[ "$body" =~ ^(301|302|307|308)$ ]]; then
-        fail "direct http to origin is dropped by firewall" \
-             "got $body redirect — your source IP appears to be in the Cloudflare ranges, or the firewall isn't filtering :80. Test from a non-CF IP."
+    err="$(<"$errfile")"; rm -f "$errfile"
+
+    if [[ "$EXPECTED_MODE" == "test" ]]; then
+        case "$body" in
+            301|302|307|308) pass "TEST: direct http to origin answers with redirect ($body) — logged, not blocked" ;;
+            *) fail "TEST: direct http to origin reachable" "got code=$body err=${err:0:100}" ;;
+        esac
     else
-        fail "direct http to origin is dropped by firewall" "unexpected: code=$body err=${err:0:120}"
+        if [[ "$body" == "000" ]] && grep -qiE 'timed? ?out|timeout|refused' <<<"$err"; then
+            pass "DEPLOY: direct http to origin dropped by firewall"
+        elif [[ "$body" == "403" ]]; then
+            pass "DEPLOY: direct http to origin rejected by nginx (403)"
+        else
+            fail "DEPLOY: direct http to origin blocked" "got code=$body err=${err:0:100} — check firewall / test from a non-CF, non-allowlisted IP"
+        fi
     fi
 }
 
-# ---- Dispatch ---------------------------------------------------------------
-case "$MODE" in
+case "$MODE_FLAG" in
     local-only)  run_local_checks ;;
     remote-only) run_remote_checks ;;
     all)         run_local_checks; run_remote_checks ;;
 esac
 
-# ---- Summary ----------------------------------------------------------------
 echo
 echo "------------------------------------------------------------"
 printf '%s%d PASS%s   %s%d FAIL%s   %s%d SKIP%s\n' \
-    "$C_OK" "$PASS_COUNT" "$C_RST" \
-    "$C_FAIL" "$FAIL_COUNT" "$C_RST" \
-    "$C_SKIP" "$SKIP_COUNT" "$C_RST"
+    "$C_OK" "$PASS_COUNT" "$C_RST" "$C_FAIL" "$FAIL_COUNT" "$C_RST" "$C_SKIP" "$SKIP_COUNT" "$C_RST"
 
 (( FAIL_COUNT == 0 ))
