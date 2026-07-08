@@ -1,15 +1,25 @@
-# OwnTrackDebianHardener
+# CloudFlareDebianHardener-OwnTrackFlavoured
 
 **Version 2.3.0**
 
-A Debian 12 daemon that locks down an [OwnTracks](https://owntracks.org/)
-deployment so only Cloudflare can reach it — with a **test-first workflow**:
-observe exactly what *would* be blocked before you enforce anything.
+A Debian 12 daemon that locks down an **nginx deployment** so only Cloudflare
+can reach it — a dynamic nginx + firewall allowlist driven by Cloudflare's own
+published IP ranges, with Authenticated Origin Pulls (mTLS) on by default. It
+works for **any HTTP/HTTPS service you serve through nginx and front with
+Cloudflare**; it just ships **OwnTracks-flavoured defaults** for the settings
+where a default helps (server-name detection, the `8083` recorder port, some
+naming). See [Beyond OwnTracks](#beyond-owntracks--what-else-this-hardens) for
+using it with Grafana, Nextcloud, Gitea, and friends.
 
-The internal commands and config paths use a short `cf-owntracks` prefix
+It runs a **test-first workflow**: observe exactly what *would* be blocked in a
+decision log before you enforce anything.
+
+The internal commands and config paths keep a short `cf-owntracks` prefix
 (`cf-owntracks-refresh`, `/etc/cf-owntracks/config`, `inet cf_owntracks`
-nftables table, etc.) — these are the stable runtime identifiers.
-"OwnTrackDebianHardener" is the project name.
+nftables table, etc.) — these are the stable runtime identifiers and are
+deliberately unchanged by the rename. The project/repo name is
+**CloudFlareDebianHardener-OwnTrackFlavoured**; "OwnTracks-flavoured" signals
+that the OwnTracks case is the best-trodden path, not the only one.
 
 > **⚠ v2 breaking change:** running `install.sh` now defaults to **TEST mode**
 > (nothing enforces). Pass `--deploy` for the enforcing behavior that v1
@@ -155,8 +165,8 @@ First install — clone the repo onto the Debian 12 box:
 
 ```sh
 sudo apt-get install -y git          # if git isn't there yet
-git clone https://github.com/Kinsman4249/OwnTrackDebianHardener.git
-cd OwnTrackDebianHardener
+git clone https://github.com/Kinsman4249/CloudFlareDebianHardener-OwnTrackFlavoured.git
+cd CloudFlareDebianHardener-OwnTrackFlavoured
 # Files are stored non-executable in the repo. Tell git to ignore
 # executable-bit differences so the chmod below never turns into a
 # "local changes would be overwritten" conflict on a future `git pull`.
@@ -171,21 +181,21 @@ chmod +x install.sh uninstall.sh smoke-test.sh bin/cf-owntracks-refresh
 Updating an existing clone to the latest version:
 
 ```sh
-cd OwnTrackDebianHardener
+cd CloudFlareDebianHardener-OwnTrackFlavoured
 git config core.fileMode false   # once per clone; harmless to repeat
 git pull                         # no conflict even though you chmod'd earlier
 sudo bash install.sh             # re-run; your settings are the defaults
 ```
 
-To pin a specific release instead of `main`: `git checkout v2.1.0`
-(or `git pull --tags && git checkout v2.1.0` on an existing clone).
+To pin a specific release instead of `main`: `git checkout v2.3.0`
+(or `git pull --tags && git checkout v2.3.0` on an existing clone).
 
 No git? Grab a release tarball (tarballs preserve the executable bit, so no
 chmod dance needed):
 
 ```sh
-curl -L https://github.com/Kinsman4249/OwnTrackDebianHardener/archive/refs/tags/v2.1.0.tar.gz | tar xz
-cd OwnTrackDebianHardener-2.1.0
+curl -L https://github.com/Kinsman4249/CloudFlareDebianHardener-OwnTrackFlavoured/archive/refs/tags/v2.3.0.tar.gz | tar xz
+cd CloudFlareDebianHardener-OwnTrackFlavoured-2.3.0
 sudo bash install.sh
 ```
 
@@ -501,7 +511,7 @@ sudo ./smoke-test.sh                                        # on origin
 ## Upgrading from 1.x
 
 ```sh
-cd OwnTrackDebianHardener
+cd CloudFlareDebianHardener-OwnTrackFlavoured
 git config core.fileMode false   # once per clone; ignores chmod exec-bit deltas
 git pull
 sudo bash install.sh
